@@ -1,0 +1,300 @@
+/** 发送保留模型错误与默认隔离，旧宿主缺少切换接口不阻断普通消息。 */
+'use strict';
+
+/** Mobile send handler: accepted modes pass through and omitted mode defaults at the host bridge. */
+
+const { EventEmitter } = require('node:events');
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const {
+  handleSend,
+  MODEL_UNAVAILABLE_ERROR,
+  promptErrorObject,
+} = require('../lib/mobile/sessions.js');
+
+function request(body) {
+  const req = new EventEmitter();
+  req.url = '/api/mobile/v1/session/send';
+  req.headers = { 'x-dsh-device': 'phone-1' };
+  process.nextTick(() => {
+    req.emit('data', JSON.stringify(body));
+    req.emit('end');
+  });
+  return req;
+}
+
+function response() {
+  return {
+    status: 0,
+    body: null,
+    writeHead(status) { this.status = status; },
+    end(value) { this.body = JSON.parse(String(value)); },
+  };
+}
+
+function ctxWithPrompt(prompt) {
+  return { apiProxy: { sessions: { prompt } } };
+}
+
+const payload = { sessionId: 's-1', text: 'hello', clientMessageId: 'cm-1' };
+
+test('normalizes no-model prompt failures to a stable actionable error', () => {
+  assert.deepEqual(promptErrorObject(new Error('No model is configured')), MODEL_UNAVAILABLE_ERROR);
+  assert.deepEqual(promptErrorObject({ code: 'model-not-routable', message: 'provider is offline' }), MODEL_UNAVAILABLE_ERROR);
+});
+
+test('returns stable no-model error for rejected host prompts', async () => {
+  const ctx = ctxWithPrompt(async () => ({ result: { ok: false, error: { code: 'model-error', message: 'No model configured for this session' } } }));
+  const res = response();
+  await handleSend(ctx, request(payload), res);
+  assert.equal(res.status, 400);
+  assert.deepEqual(res.body, { ok: false, error: MODEL_UNAVAILABLE_ERROR });
+});
+
+test('normalizes thrown no-model errors instead of leaking a server failure', async () => {
+  const ctx = ctxWithPrompt(async () => { throw new Error('selected model is not routable'); });
+  const res = response();
+  await handleSend(ctx, request(payload), res);
+  assert.equal(res.status, 400);
+  assert.deepEqual(res.body, { ok: false, error: MODEL_UNAVAILABLE_ERROR });
+});
+
+test('requires an explicit accepted acknowledgement', async () => {
+  const ctx = ctxWithPrompt(async () => ({ result: { ok: true, value: { accepted: true } } }));
+  const res = response();
+  await handleSend(ctx, request(payload), res);
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body, { ok: true, accepted: true });
+});
+
+test('omitted send mode remains absent from the mobile payload for host-bridge defaulting', async () => {
+  let received;
+  const ctx = ctxWithPrompt(async (value) => {
+    received = value;
+    return { result: { ok: true, value: { accepted: true } } };
+  });
+  const res = response();
+  await handleSend(ctx, request({ sessionId: 's-1', content: [{ type: 'text', text: 'hello' }] }), res);
+  assert.equal(res.status, 200);
+  assert.equal(Object.hasOwn(received.payload, 'mode'), false);
+});
+
+test('explicit busy-send modes are passed through unchanged', async () => {
+  for (const mode of ['queue', 'steer']) {
+    let received;
+    const ctx = ctxWithPrompt(async (value) => {
+      received = value;
+      return { result: { ok: true, value: { accepted: true } } };
+    });
+    const res = response();
+    await handleSend(ctx, request({ sessionId: 's-1', mode, content: [{ type: 'text', text: 'hello' }] }), res);
+    assert.equal(res.status, 200);
+    assert.equal(received.payload.mode, mode);
+  }
+});
+
+// ── 宿主错误的 details 透传 ────────────────────────────────────────
+// 移动端要靠 details.reason 把 attachment-error 翻成中文（与桌面端
+// attachmentErrorText 同一契约）；旧实现只回 { code, message }，reason 被吞掉，
+// 手机只能显示宿主那句英文原文。
+
+test('keeps a plain-object details payload from the host', () => {
+  assert.deepEqual(
+    promptErrorObject({
+      code: 'attachment-error',
+      message: 'Model "deepseek-v4-flash" does not support image input.',
+      details: { reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES' },
+    }),
+    {
+      code: 'attachment-error',
+      message: 'Model "deepseek-v4-flash" does not support image input.',
+      details: { reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES' },
+    },
+  );
+});
+
+test('drops details that are not a plain object', () => {
+  for (const details of ['nope', 7, true, null, ['x'], new Error('boom')]) {
+    const normalized = promptErrorObject({ code: 'attachment-error', message: 'rejected', details });
+    assert.deepEqual(normalized, { code: 'attachment-error', message: 'rejected' });
+  }
+});
+
+test('keeps details for other host codes too', () => {
+  assert.deepEqual(promptErrorObject({ code: 'settings-conflict', message: 'stale', details: { ns: 'ui-theme', expected: 1, actual: 2 } }).details, {
+    ns: 'ui-theme',
+    expected: 1,
+    actual: 2,
+  });
+});
+
+test('no-model normalization still wins over details', () => {
+  assert.deepEqual(promptErrorObject({ code: 'model-unavailable', message: 'no model', details: { reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES' } }), MODEL_UNAVAILABLE_ERROR);
+});
+
+test('an image send rejected by the host reaches the phone with its reason code', async () => {
+  const ctx = ctxWithPrompt(async () => ({
+    result: {
+      ok: false,
+      error: {
+        code: 'attachment-error',
+        message: 'Model "deepseek-v4-flash" does not support image input.',
+        details: { reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES' },
+      },
+    },
+  }));
+  const res = response();
+  await handleSend(
+    ctx,
+    request({
+      sessionId: 's-1',
+      clientMessageId: 'cm-img',
+      content: [
+        { type: 'image', mediaType: 'image/png', data: 'AAAA', name: 'probe.png' },
+        { type: 'text', text: 'IMG-PROBE-1' },
+      ],
+    }),
+    res,
+  );
+  assert.equal(res.status, 400);
+  assert.deepEqual(res.body, {
+    ok: false,
+    error: {
+      code: 'attachment-error',
+      message: 'Model "deepseek-v4-flash" does not support image input.',
+      details: { reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES' },
+    },
+  });
+});
+
+test('source contract: errorDetails guards the spread', () => {
+  const source = require('node:fs').readFileSync(require('node:path').join(__dirname, '../lib/mobile/history-derive.js'), 'utf8');
+  assert.ok(source.includes('function errorDetails(error)'), 'errorDetails helper');
+  assert.ok(source.includes("typeof details !== 'object' || Array.isArray(details)"), 'plain-object guard');
+  assert.ok(source.includes('proto !== Object.prototype && proto !== null'), 'prototype guard');
+  assert.ok(source.includes('...(details ? { details } : {})'), 'details spread');
+});
+
+// ── 发送携带模型（选模型只写本地，随发送一起带）──────────────────────────
+// App 侧选模型不再单独发 /session/select-model，而是把这一发要用的模型塞进 send 的
+// `modelSelection`；插件必须在提交 prompt 之前把它应用到会话上，且模型不可用时明确回 400。
+
+function ctxWithModel(promptStub, { unavailable = false, resolveError, invalidConfig = false, missingController = false, missingSelect = false } = {}) {
+  const events = [];
+  const agent = { model: missingSelect ? {} : { select: (selection) => events.push(['selected', selection]) } };
+  const services = {
+    sessionController: missingController ? {} : { resolveAgent: async (id) => { events.push(['resolve', id]); return resolveError ? { error: resolveError } : { agent }; } },
+    llm: { listProviders: () => [{ id: 'p' }], listModels: async () => (unavailable ? [] : [{ id: 'B' }]),
+      resolveCallConfig: async (selection) => { events.push(['validated', selection]); if (invalidConfig) throw Error('invalid effort'); } },
+  };
+  const prompt = async (value) => { events.push(['prompt']); return promptStub(value); };
+  return { ctx: { get: (key) => services[key], apiProxy: { sessions: { prompt } } }, events };
+}
+
+test('发送带 modelSelection 时先把它应用到会话，再提交 prompt', async () => {
+  const { ctx, events } = ctxWithModel(async () => ({ result: { ok: true, value: { accepted: true } } }));
+  const res = response();
+  await handleSend(ctx, request({
+    sessionId: 's-1', clientMessageId: 'cm-model',
+    content: [{ type: 'text', text: 'hi' }],
+    modelSelection: { provider: 'p', model: 'B', reasoningEffort: 'high' },
+  }), res);
+  assert.equal(res.status, 200);
+  // 先 validate/select，最后才 prompt —— 模型必须在 prompt 之前落到会话上。
+  assert.deepEqual(events.map(([type]) => type), ['resolve', 'validated', 'selected', 'prompt']);
+  assert.deepEqual(events.at(-2)[1], { provider: 'p', model: 'B', reasoningEffort: 'high' });
+});
+
+test('不带 modelSelection 时不应用模型（老 App 行为不变）', async () => {
+  const { ctx, events } = ctxWithModel(async () => ({ result: { ok: true, value: { accepted: true } } }));
+  const res = response();
+  await handleSend(ctx, request({ sessionId: 's-1', clientMessageId: 'cm-no-model', content: [{ type: 'text', text: 'hi' }] }), res);
+  assert.equal(res.status, 200);
+  assert.deepEqual(events.map(([type]) => type), ['prompt']);
+});
+
+test('所选模型不可用时明确回 400，且不提交 prompt（不静默沿用旧模型）', async () => {
+  const { ctx, events } = ctxWithModel(async () => ({ result: { ok: true, value: { accepted: true } } }), { unavailable: true });
+  const res = response();
+  await handleSend(ctx, request({
+    sessionId: 's-1', clientMessageId: 'cm-bad',
+    content: [{ type: 'text', text: 'hi' }],
+    modelSelection: { provider: 'p', model: 'B' },
+  }), res);
+  assert.equal(res.status, 400);
+  assert.equal(res.body.error.code, 'session/model-unavailable');
+  assert.ok(!events.some(([type]) => type === 'prompt'), '模型不可用时不能把消息发出去');
+  assert.ok(!events.some(([type]) => type === 'selected'));
+});
+
+test('模型配置无效（如档位不认）时回 400，且不提交 prompt', async () => {
+  const { ctx, events } = ctxWithModel(async () => ({ result: { ok: true, value: { accepted: true } } }), { invalidConfig: true });
+  const res = response();
+  await handleSend(ctx, request({
+    sessionId: 's-1', clientMessageId: 'cm-bad-effort',
+    content: [{ type: 'text', text: 'hi' }],
+    modelSelection: { provider: 'p', model: 'B', reasoningEffort: 'nope' },
+  }), res);
+  assert.equal(res.status, 400);
+  assert.ok(!events.some(([type]) => type === 'prompt'));
+});
+
+// #70：发送允许旧宿主沿用当前会话模型，独立切换接口仍明确拒绝不支持的操作。
+async function sendOnLegacyHost(send, options) {
+  const { ctx, events } = ctxWithModel(async () => ({ result: { ok: true, value: { accepted: true } } }), options);
+  ctx.get = ((get) => (key) => {
+    if (key === 'agentDefaultModel') return { saveSelection() { throw Error('must not save desktop default'); } };
+    return get(key);
+  })(ctx.get);
+  ctx.apiProxy.sessions.selectModel = () => { throw Error('must not use legacy default-saving selector'); };
+  const res = response();
+  await send(ctx, request({ sessionId: 's-1', text: 'hi', modelSelection: { provider: 'p', model: 'B' } }), res);
+  return { res, events };
+}
+
+for (const options of [{ missingController: true }, { missingSelect: true }]) {
+  test(`旧宿主缺少${options.missingController ? '会话查找' : '模型选择'}接口仍发送普通消息`, async () => {
+    const { res, events } = await sendOnLegacyHost(handleSend, options);
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body, { ok: true, accepted: true });
+    assert.equal(events.filter(([type]) => type === 'prompt').length, 1);
+    assert.ok(!events.some(([type]) => type === 'selected'));
+  });
+}
+
+test('模型服务未就绪或会话恢复失败仍阻止发送', async () => {
+  for (const code of ['host-unavailable', 'session/agent-busy']) {
+    const { ctx, events } = ctxWithModel(async () => { throw Error('must not prompt'); }, { resolveError: { code, message: 'try later' } });
+    const res = response();
+    await handleSend(ctx, request({ sessionId: 's-1', text: 'hi', modelSelection: { provider: 'p', model: 'B' } }), res);
+    assert.equal(res.status, 400);
+    assert.equal(res.body.error.code, code);
+    assert.ok(!events.some(([type]) => type === 'prompt'));
+  }
+});
+
+test('变异证明：恢复旧宿主模型切换硬门槛会被发送断言抓住', async () => {
+  const fs = require('node:fs');
+  const vm = require('node:vm');
+  const { createRequire } = require('node:module');
+  const file = require.resolve('../lib/mobile/session-send.js');
+  const source = fs.readFileSync(file, 'utf8');
+  const marker = "result?.error?.code !== 'host-unsupported' && ";
+  assert.ok(source.includes(marker));
+  const mod = { exports: {} };
+  vm.runInNewContext(source.replace(marker, ''), { module: mod, exports: mod.exports, require: createRequire(file), Buffer, URL });
+  const { res } = await sendOnLegacyHost(mod.exports.handleSend, { missingController: true });
+  assert.throws(() => assert.equal(res.status, 200), { code: 'ERR_ASSERTION' });
+});
+
+test('modelSelection 形状不认识时按“没带”处理，不报错', async () => {
+  const { ctx, events } = ctxWithModel(async () => ({ result: { ok: true, value: { accepted: true } } }));
+  const res = response();
+  await handleSend(ctx, request({
+    sessionId: 's-1', clientMessageId: 'cm-shape',
+    content: [{ type: 'text', text: 'hi' }],
+    modelSelection: { provider: '', model: '' },
+  }), res);
+  assert.equal(res.status, 200);
+  assert.deepEqual(events.map(([type]) => type), ['prompt']);
+});

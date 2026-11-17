@@ -1,0 +1,480 @@
+'use strict';
+
+/**
+ * 连接自检：防火墙只读探测的三平台解析、五档结论的判据，以及缓存。
+ *
+ * 这里钉的是「哪一档话能说、哪一档不许瞎说」——
+ *
+ *  1. **读不到就是读不到**：`supported / enabled / allowsApp` 为 `null` 时结论只能是
+ *     `unknown`。把「不知道」写成「正常」，正是这次要治的那个「用户只能自己猜」。
+ *  2. **手机来过就排在防火墙前面**：人家正用着的时候弹一句「防火墙挡着」比不弹更糟。
+ *  3. **Windows 的规则按网络类别生效**：只放行「专用」的老规则遇到被判成「公用」的
+ *     新 WiFi 就不再生效 —— 这就是「出去一趟就连不上」的真身，这条顺序不许挪。
+ *  4. **缓存只管省进程**：同一份结果给面板弹窗与后台巡检共用，「重新自检」能强制穿过去。
+ */
+
+const assert = require('node:assert/strict');
+const test = require('node:test');
+
+const {
+  WINDOWS_SCRIPT,
+  parseDarwinState,
+  parseDarwinAppAllowed,
+  parseWindowsReport,
+  windowsRuleApplies,
+  decideWindowsAllows,
+  probeFirewall,
+  readFirewall,
+  resetFirewallCache,
+} = require('../lib/relay/firewall-probe.js');
+const { MOBILE_RECENT_MS, verdictOf, createConnectionCheck } = require('../lib/relay/connection-check.js');
+
+/** 假执行器：按命令行回预置的 stdout，并记下被调了几次。 */
+function fakeExec(answers) {
+  const calls = [];
+  const exec = async (command, args) => {
+    calls.push([command, ...(args || [])].join(' '));
+    const key = command;
+    const answer = answers[key];
+    if (!answer) return { code: 1, stdout: '', stderr: '', error: 'NO_COMMAND' };
+    if (answer instanceof Error) throw answer;
+    return { code: 0, stdout: answer, stderr: '', error: null };
+  };
+  return { exec, calls };
+}
+
+const SOCKETFILTER = '/usr/libexec/ApplicationFirewall/socketfilterfw';
+
+test('macOS：State = 0 是关，1 与 2 都是开', () => {
+  assert.equal(parseDarwinState('Firewall is disabled. (State = 0)'), false);
+  assert.equal(parseDarwinState('Firewall is enabled. (State = 1)'), true);
+  // 2 = 拦全部非必要入站连接，也是开，只是更狠。
+  assert.equal(parseDarwinState('Firewall is set to block all non-essential incoming connections. (State = 2)'), true);
+  // 认不出就回 null：别把一句看不懂的话当成「没问题」。
+  assert.equal(parseDarwinState('usage: socketfilterfw ...'), null);
+  assert.equal(parseDarwinState(''), null);
+});
+
+test('macOS：permitted / blocked 两种回答，第三句不算答案', () => {
+  assert.equal(parseDarwinAppAllowed('Incoming connection to /opt/homebrew/bin/node is permitted.'), true);
+  assert.equal(parseDarwinAppAllowed('Incoming connection to /usr/local/bin/node is blocked.'), false);
+  assert.equal(parseDarwinAppAllowed('Incoming connection to /usr/local/bin/node is not allowed.'), false);
+  assert.equal(parseDarwinAppAllowed('No such file or directory'), null);
+});
+
+test('macOS 探测：防火墙开着并且挡着这个程序', async () => {
+  const { exec, calls } = fakeExec({
+    [SOCKETFILTER]: 'Firewall is enabled. (State = 1)',
+  });
+  // 同一个可执行文件要问两条，所以按参数分流。
+  const smartExec = async (command, args, options) => {
+    const joined = `${command} ${(args || []).join(' ')}`;
+    calls.push(joined);
+    if (command !== SOCKETFILTER) return { code: 1, stdout: '', stderr: '', error: 'NO_COMMAND' };
+    if ((args || [])[0] === '--getglobalstate') {
+      return { code: 0, stdout: 'Firewall is enabled. (State = 1)', stderr: '', error: null };
+    }
+    return { code: 0, stdout: 'Incoming connection to /opt/homebrew/bin/node is blocked.', stderr: '', error: null };
+  };
+  void exec;
+  const result = await probeFirewall({ platform: 'darwin', execPath: '/opt/homebrew/bin/node', exec: smartExec });
+  assert.deepEqual(result, {
+    supported: true,
+    enabled: true,
+    allowsApp: false,
+    appPath: '/opt/homebrew/bin/node',
+    reason: null,
+  });
+  // 查的必须是宿主进程自己那个可执行文件，不是写死的 node。
+  assert.ok(calls.some((call) => call.includes('/opt/homebrew/bin/node')));
+});
+
+test('macOS 探测：命令不在（不是 macOS 的路径形态）就如实报查不到', async () => {
+  const { exec } = fakeExec({});
+  const result = await probeFirewall({ platform: 'darwin', execPath: '/usr/bin/node', exec });
+  assert.equal(result.supported, false);
+  assert.equal(result.enabled, null);
+  assert.equal(result.allowsApp, null);
+  assert.equal(result.reason, 'no-command');
+});
+
+test('Windows：报告解析收得下数组与单条两种形状', () => {
+  const both = parseWindowsReport(JSON.stringify({
+    profiles: [{ name: 'Domain', enabled: false }, { name: 'Private', enabled: true }, { name: 'Public', enabled: true }],
+    apps: [{ program: 'C:\\Program Files\\nodejs\\node.exe', action: 'Allow', enabled: true, profile: 'Any' }],
+    activeProfiles: ['Public'],
+  }));
+  assert.deepEqual(both.activeProfiles, ['Public']);
+  assert.equal(both.profiles.filter((item) => item.enabled).length, 2);
+  assert.equal(both.apps.length, 1);
+
+  // 只有一条时 ConvertTo-Json 会把数组退化成一个对象，不认这个形状就会当场崩。
+  const single = parseWindowsReport(JSON.stringify({
+    profiles: { name: 'Public', enabled: true },
+    apps: { program: 'C:\\node.exe', action: 'Block', enabled: true, profile: 'Any' },
+    activeProfiles: 'Public',
+  }));
+  assert.equal(single.profiles.length, 1);
+  assert.equal(single.apps.length, 1);
+  assert.deepEqual(single.activeProfiles, ['Public']);
+
+  // 条数用来区分「一条规则都没有」和「规则没读出来」；报里没有这两格就是 null，不是 0。
+  const counted = parseWindowsReport(JSON.stringify({ profiles: [], apps: [], filters: 3, rules: 0 }));
+  assert.equal(counted.filters, 3);
+  assert.equal(counted.rules, 0);
+  assert.equal(parseWindowsReport('{}').filters, null);
+  assert.equal(parseWindowsReport('{}').rules, null);
+});
+
+test('Windows：Any 与逗号串都按交集判，读不到当前类别时不冤枉人', () => {
+  assert.equal(windowsRuleApplies('Any', ['Public']), true);
+  assert.equal(windowsRuleApplies('', ['Public']), true);
+  assert.equal(windowsRuleApplies('Private,Public', ['Public']), true);
+  assert.equal(windowsRuleApplies('Domain,Private', ['Public']), false);
+  assert.equal(windowsRuleApplies('Private', []), true, '读不到当前类别时按「管」算，宁可漏报也不误报');
+});
+
+test('Windows：默认入站全拒，没规则就是被挡；显式 Block 优先', () => {
+  const off = decideWindowsAllows({
+    profiles: [{ name: 'Public', enabled: false }],
+    apps: [],
+    activeProfiles: ['Public'],
+    appPath: 'C:\\node.exe',
+  });
+  assert.equal(off, true, '防火墙关着就不挡');
+
+  const noRule = decideWindowsAllows({
+    profiles: [{ name: 'Public', enabled: true }],
+    apps: [],
+    activeProfiles: ['Public'],
+    appPath: 'C:\\node.exe',
+  });
+  assert.equal(noRule, false, '开着却没放行规则 = 第一次弹框点了取消的样子');
+
+  const blocked = decideWindowsAllows({
+    profiles: [{ name: 'Public', enabled: true }],
+    apps: [{ program: 'C:\\node.exe', action: 'Block', enabled: true, profile: 'Any' }],
+    activeProfiles: ['Public'],
+    appPath: 'C:\\node.exe',
+  });
+  assert.equal(blocked, false);
+});
+
+test('Windows：规则里的端口带回来，缺的按空串（当不限）', () => {
+  const report = parseWindowsReport(JSON.stringify({
+    profiles: [{ name: 'Public', enabled: true }],
+    apps: [{ program: 'C:\\node.exe', action: 'Allow', enabled: true, profile: 'Any', localPort: '18787' }],
+  }));
+  assert.equal(report.apps[0].localPort, '18787');
+  assert.equal(
+    parseWindowsReport(JSON.stringify({ profiles: [], apps: [{ program: 'C:\\node.exe' }] })).apps[0].localPort,
+    '',
+  );
+});
+
+test('Windows：规则只放行别的端口时，端口漂走后不算放行', () => {
+  const base = {
+    profiles: [{ name: 'Public', enabled: true }],
+    activeProfiles: ['Public'],
+    appPath: 'C:\\Program Files\\nodejs\\node.exe',
+  };
+  const allow = (localPort, action = 'Allow') => ({
+    ...base,
+    apps: [{ program: 'C:\\Program Files\\nodejs\\node.exe', action, enabled: true, profile: 'Any', localPort }],
+  });
+  // 老规则放行 18787、程序路径也对得上，但当前监听 1523 —— 不覆盖，实际被默认规则挡着。
+  assert.equal(decideWindowsAllows({ ...allow('18787'), port: 1523 }), false);
+  // 同一端口就放行。
+  assert.equal(decideWindowsAllows({ ...allow('18787'), port: 18787 }), true);
+  // 一条 Block 收窄到别的端口，不该误伤当前端口：当前有 Any 放行就该放行。
+  assert.equal(decideWindowsAllows({
+    ...base,
+    port: 1523,
+    apps: [
+      { program: 'C:\\Program Files\\nodejs\\node.exe', action: 'Block', enabled: true, profile: 'Any', localPort: '18787' },
+      { program: 'C:\\Program Files\\nodejs\\node.exe', action: 'Allow', enabled: true, profile: 'Any', localPort: 'Any' },
+    ],
+  }), true);
+  // Any / 空串当不限：换端口也放行。
+  assert.equal(decideWindowsAllows({ ...allow('Any'), port: 1523 }), true);
+  assert.equal(decideWindowsAllows({ ...allow(''), port: 1523 }), true);
+  // 端口范围与逗号串都认。
+  assert.equal(decideWindowsAllows({ ...allow('1500-1600'), port: 1523 }), true);
+  assert.equal(decideWindowsAllows({ ...allow('1500-1600'), port: 1623 }), false);
+  assert.equal(decideWindowsAllows({ ...allow('80,443,1523'), port: 1523 }), true);
+  // 当前端口不知道（0）时不按端口收窄，跟旧行为一致。
+  assert.equal(decideWindowsAllows({ ...allow('18787'), port: 0 }), true);
+});
+
+test('Windows：放行规则只覆盖「专用网络」时，接到公用网络上就不生效', () => {
+  const report = (active, profile) => decideWindowsAllows({
+    profiles: [{ name: 'Private', enabled: true }, { name: 'Public', enabled: true }],
+    apps: [{ program: 'C:\\Program Files\\nodejs\\node.exe', action: 'Allow', enabled: true, profile }],
+    activeProfiles: [active],
+    appPath: 'c:\\program files\\nodejs\\node.exe',
+  });
+  // 路径不分大小写：规则里存的和进程报的不一定同一种写法。
+  assert.equal(report('Private', 'Private'), true);
+  assert.equal(report('Public', 'Private'), false, '在家能用、出门不能用，就是这一条');
+  assert.equal(report('Public', 'Domain,Private,Public'), true);
+  assert.equal(report('Public', 'Any'), true);
+});
+
+test('Windows 探测：走 PowerShell 拿 JSON，进程路径大写小写都认', async () => {
+  const payload = {
+    profiles: [{ name: 'Private', enabled: true }],
+    apps: [{ program: 'C:\\Program Files\\nodejs\\node.exe', action: 'Allow', enabled: true, profile: 'Any' }],
+    activeProfiles: ['Private'],
+  };
+  const { exec } = fakeExec({ 'powershell.exe': JSON.stringify(payload) });
+  const result = await probeFirewall({ platform: 'win32', execPath: 'c:\\program files\\nodejs\\node.exe', exec });
+  assert.equal(result.supported, true);
+  assert.equal(result.enabled, true);
+  assert.equal(result.allowsApp, true);
+});
+
+test('Windows 探测：输出不是 JSON 就说解析不了，不说「正常」', async () => {
+  const { exec } = fakeExec({ 'powershell.exe': 'Get-NetFirewallProfile : access denied' });
+  const result = await probeFirewall({ platform: 'win32', execPath: 'C:\\node.exe', exec });
+  assert.equal(result.supported, false);
+  assert.equal(result.enabled, null);
+  assert.equal(result.reason, 'parse-failed');
+});
+
+test('Windows 探测：PowerShell 自己失败了就没 JSON，如实报查不到', async () => {
+  const failedExec = async () => ({ code: 1, stdout: '', stderr: '', error: 'FAILED' });
+  const result = await probeFirewall({ platform: 'win32', execPath: 'C:\\node.exe', exec: failedExec });
+  assert.equal(result.supported, false);
+  assert.equal(result.enabled, null);
+  assert.equal(result.allowsApp, null);
+  assert.equal(result.reason, 'parse-failed');
+});
+
+test('Windows 探测：有 Allow 规则就放行（过滤器上 Name 为空也算数）', async () => {
+  const payload = {
+    profiles: { name: 'Public', enabled: true },
+    apps: { program: 'C:\\Program Files\\nodejs\\node.exe', action: 'Allow', enabled: true, profile: 'Any' },
+    filters: 1,
+    rules: 1,
+    activeProfiles: 'Public',
+  };
+  const { exec } = fakeExec({ 'powershell.exe': JSON.stringify(payload) });
+  const result = await probeFirewall({ platform: 'win32', execPath: 'C:\\Program Files\\nodejs\\node.exe', exec });
+  assert.equal(result.supported, true);
+  assert.equal(result.enabled, true);
+  assert.equal(result.allowsApp, true);
+});
+
+test('Windows 探测：当前监听端口带进判定，旧端口规则报挡住', async () => {
+  const payload = {
+    profiles: { name: 'Public', enabled: true },
+    apps: { program: 'C:\\Program Files\\nodejs\\node.exe', action: 'Allow', enabled: true, profile: 'Any', localPort: '18787' },
+    filters: 1,
+    rules: 1,
+    activeProfiles: 'Public',
+  };
+  const { exec } = fakeExec({ 'powershell.exe': JSON.stringify(payload) });
+  const result = await probeFirewall({ platform: 'win32', execPath: 'C:\\Program Files\\nodejs\\node.exe', port: 1523, exec });
+  assert.equal(result.supported, true);
+  assert.equal(result.allowsApp, false, '规则只放行 18787，当前 1523 → 实际被挡，不能报放行');
+});
+
+test('Windows 探测：过滤器在、规则一条没关联上，报查不到', async () => {
+  const payload = {
+    profiles: [{ name: 'Public', enabled: true }],
+    apps: [],
+    filters: 1,
+    rules: 0,
+    activeProfiles: ['Public'],
+  };
+  const { exec } = fakeExec({ 'powershell.exe': JSON.stringify(payload) });
+  const result = await probeFirewall({ platform: 'win32', execPath: 'C:\\node.exe', exec });
+  assert.equal(result.supported, false);
+  assert.equal(result.allowsApp, null);
+  assert.equal(result.reason, 'parse-failed');
+});
+
+test('Windows：开关与规则都查生效策略，不查本地静态库', () => {
+  // 不写 `-PolicyStore` 时 PowerShell 读的是本地静态库（persistent store），而它不含
+  // 组策略下发的开关与规则。组策略管着的机器上，系统界面显示防火墙开着，按本地库读
+  // 出来三个 profile 全是「关」——「实际开着、自检说关着」就是这一条。
+  assert.match(WINDOWS_SCRIPT, /Get-NetFirewallProfile -PolicyStore ActiveStore/);
+  assert.match(WINDOWS_SCRIPT, /Get-NetFirewallApplicationFilter -PolicyStore ActiveStore -Program \$path/);
+  assert.match(WINDOWS_SCRIPT, /Get-NetFirewallRule -PolicyStore ActiveStore/);
+  // 规则若收窄了端口，要把端口带回来，否则端口漂走后旧规则仍被当成放行。
+  assert.match(WINDOWS_SCRIPT, /Get-NetFirewallPortFilter -PolicyStore ActiveStore/);
+  assert.match(WINDOWS_SCRIPT, /localPort = /);
+});
+
+test('Windows：规则要从应用过滤器反查，不能拿过滤器上的 Name 当规则名', () => {
+  // 应用过滤器对象的 `Name` 恒为空（规则 ID 不在那儿）。拿它去 `Get-NetFirewallRule -Name`，
+  // 一条都查不到 —— 明明有 Allow 规则也会被读成「没有放行」，界面上就是「防火墙挡住了」，
+  // 而用户那边端口在听、手机就是连不上。这是 Windows 上误报的唯一来源。
+  assert.doesNotMatch(WINDOWS_SCRIPT, /-Name \$f\.Name/);
+  assert.match(WINDOWS_SCRIPT, /\$f \| Get-NetFirewallRule/);
+});
+
+test('Windows：查询本身失败就是查不到，不许当成「一条放行规则都没有」', () => {
+  // 默认的 ErrorActionPreference 只往错误流写一行、接着往下跑：循环一条不转，输出跟
+  // 「这台没有规则」一模一样。必须是整个脚本失败（非零退出），这边才报得出查不到。
+  assert.match(WINDOWS_SCRIPT, /\$ErrorActionPreference = "Stop"/);
+  // 出站规则跟「手机连进来」无关，混进来会把「没有入站放行」看成「有规则」。
+  assert.match(WINDOWS_SCRIPT, /\.Direction\)" -ne "Inbound"/);
+});
+
+test('Windows：查到了过滤器却关联不上规则，判「查不到」而不是「被挡」', () => {
+  assert.equal(decideWindowsAllows({
+    profiles: [{ name: 'Public', enabled: true }],
+    apps: [],
+    filters: 2,
+    rules: 0,
+    activeProfiles: ['Public'],
+    appPath: 'C:\\node.exe',
+  }), null, '规则没读出来 ≠ 这台没放行');
+  // 是真的没有这个程序的规则：还是默认拒绝（第一次弹框点了取消的样子）。
+  assert.equal(decideWindowsAllows({
+    profiles: [{ name: 'Public', enabled: true }],
+    apps: [],
+    filters: 0,
+    rules: 0,
+    activeProfiles: ['Public'],
+    appPath: 'C:\\node.exe',
+  }), false);
+});
+
+test('Linux：只读得到「开着没」，放行与否一律是查不到', async () => {
+  const running = fakeExec({ 'firewall-cmd': 'running' });
+  const one = await probeFirewall({ platform: 'linux', execPath: '/usr/bin/node', exec: running.exec });
+  assert.deepEqual(one, { supported: true, enabled: true, allowsApp: null, appPath: '/usr/bin/node', reason: null });
+
+  const stopped = fakeExec({ 'firewall-cmd': 'not running' });
+  const two = await probeFirewall({ platform: 'linux', execPath: '/usr/bin/node', exec: stopped.exec });
+  assert.equal(two.enabled, false);
+  assert.equal(two.allowsApp, null);
+
+  // 规则读取要 root，那条我们不碰 —— 所以 Linux 上「防火墙开着」不等于「被挡」。
+  const nothing = fakeExec({});
+  const three = await probeFirewall({ platform: 'linux', execPath: '/usr/bin/node', exec: nothing.exec });
+  assert.equal(three.supported, false);
+  assert.equal(three.reason, 'no-command');
+});
+
+test('陌生平台：直接报不支持，不猜', async () => {
+  const { exec } = fakeExec({});
+  const result = await probeFirewall({ platform: 'freebsd', execPath: '/usr/local/bin/node', exec });
+  assert.equal(result.supported, false);
+  assert.equal(result.reason, 'unsupported');
+});
+
+test('五档结论：先看有没有在听，再看来没来过，最后才轮到防火墙', () => {
+  const now = 1_000_000_000;
+  const recent = now - 60_000;
+  const stale = now - MOBILE_RECENT_MS - 1;
+
+  assert.equal(verdictOf({ listeningState: 'off', firewall: null, lastMobileAt: recent, now }), 'not-listening');
+  assert.equal(verdictOf({ listeningState: 'listening', firewall: { supported: true, allowsApp: false }, lastMobileAt: recent, now }), 'ok');
+  assert.equal(verdictOf({ listeningState: 'listening', firewall: { supported: true, allowsApp: false }, lastMobileAt: stale, now }), 'firewall-blocked');
+  assert.equal(verdictOf({ listeningState: 'listening', firewall: { supported: false, allowsApp: null }, lastMobileAt: 0, now }), 'unknown');
+  assert.equal(verdictOf({ listeningState: 'listening', firewall: { supported: true, allowsApp: null }, lastMobileAt: 0, now }), 'unknown');
+  assert.equal(verdictOf({ listeningState: 'listening', firewall: { supported: true, allowsApp: true }, lastMobileAt: 0, now }), 'network');
+  assert.equal(verdictOf({ listeningState: 'listening', firewall: null, lastMobileAt: 0, now }), 'unknown');
+});
+
+test('自检载荷：四行数据与结论对得上，字段缺了也不抛', async () => {
+  const now = 2_000_000;
+  const check = createConnectionCheck({
+    platform: 'darwin',
+    now: () => now,
+    status: () => ({
+      lan: { state: 'listening', port: 18787, adjusted: true },
+      tunnel: { state: 'connected' },
+      relayUrl: 'https://relay.example.com',
+    }),
+    lanCandidates: (port) => [{ url: `http://192.168.1.5:${port}` }, { url: '' }],
+    mobileActivity: () => ({ lastMobileAt: now - 5 * 60 * 1000 }),
+    probeFirewall: async () => ({ supported: true, enabled: true, allowsApp: false, appPath: '/opt/homebrew/bin/node', reason: null }),
+  });
+  const view = await check.run();
+  assert.equal(view.ok, true);
+  assert.equal(view.platform, 'darwin');
+  // 手机来过就压过防火墙：人家正用着，别报红字。
+  assert.equal(view.verdict, 'ok');
+  assert.deepEqual(view.listening, {
+    state: 'listening',
+    port: 18787,
+    urls: ['http://192.168.1.5:18787'],
+    portAdjusted: true,
+  });
+  assert.deepEqual(view.tunnel, { state: 'connected', relayUrl: 'https://relay.example.com' });
+  assert.equal(view.mobile.idle, false);
+
+  // 宿主状态读不到时如实报 off / 0，不抛。
+  const empty = createConnectionCheck({
+    platform: 'linux',
+    now: () => now,
+    status: () => ({}),
+    lanCandidates: () => [],
+    mobileActivity: () => ({}),
+    probeFirewall: async () => { throw new Error('boom'); },
+  });
+  const bare = await empty.run();
+  assert.equal(bare.verdict, 'not-listening');
+  assert.equal(bare.firewall, null);
+  assert.equal(bare.mobile.lastMobileAt, 0);
+  assert.equal(bare.mobile.idle, true);
+});
+
+test('缓存：同一平台只探一次，「重新自检」能穿过去', async () => {
+  resetFirewallCache();
+  let probes = 0;
+  const counting = async () => {
+    probes += 1;
+    return { supported: true, enabled: false, allowsApp: true, appPath: '/usr/bin/node', reason: null };
+  };
+  resetFirewallCache();
+  await readFirewall({ platform: 'linux', exec: counting });
+  await readFirewall({ platform: 'linux', exec: counting });
+  assert.equal(probes, 1, '弹窗与后台巡检共用同一份结果，不各起一个进程');
+  await readFirewall({ platform: 'linux', exec: counting, force: true });
+  assert.equal(probes, 2);
+  resetFirewallCache();
+});
+
+test('直连隧道：自检真去拨下游端口，ready 但下游没人听要如实报不通', async () => {
+  const now = 3_000_000;
+  const mk = (tailcat, probe) => createConnectionCheck({
+    platform: 'linux',
+    now: () => now,
+    status: () => ({ lan: { state: 'off', port: 18787 }, tunnel: { state: 'connected' }, tailcat }),
+    lanCandidates: () => [],
+    mobileActivity: () => ({ lastMobileAt: 0 }),
+    probeFirewall: async () => ({ supported: false, allowsApp: null }),
+    probePort: probe,
+  });
+
+  // ready 且下游端口拨得通 → reachable true，且拨的正是报上来的那个端口。
+  const up = await mk(
+    { available: true, enabled: true, ready: true, paired: 2, targetPort: 3080 },
+    async (port) => { assert.equal(port, 3080, '要拨 selfcheck 报出来的下游端口'); return true; },
+  ).run();
+  assert.deepEqual(up.tailcat, { available: true, enabled: true, ready: true, paired: 2, targetPort: 3080, reachable: true });
+
+  // ready 但下游没人听（正是「局域网关却仍指向死端口」那一类）→ reachable false。
+  const down = await mk(
+    { available: true, enabled: true, ready: true, paired: 2, targetPort: 18787 },
+    async () => false,
+  ).run();
+  assert.equal(down.tailcat.reachable, false);
+
+  // 没起来 / 关了 → 没得测，reachable 留 null（不是「不通」），也不该去拨。
+  const idle = await mk(
+    { available: true, enabled: true, ready: false, paired: 0, targetPort: 3080 },
+    async () => { throw new Error('没 ready 不该拨端口'); },
+  ).run();
+  assert.equal(idle.tailcat.ready, false);
+  assert.equal(idle.tailcat.reachable, null);
+
+  // 宿主根本没这条通道 → tailcat 为 null。
+  const none = await mk(null, async () => true).run();
+  assert.equal(none.tailcat, null);
+});

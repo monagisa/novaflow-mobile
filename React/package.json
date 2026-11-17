@@ -1,0 +1,30 @@
+{
+  "name": "dsh-mobile-plugin-panel",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "demo": "vite --config vite.demo.config.ts --open /demo.html",
+    "build": "tsc -b && vite build && node scripts/inline.mjs",
+    "preview": "vite preview",
+    "typecheck": "tsc -b"
+  },
+  "dependencies": {
+    "@appica/ui-react": "1.2.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@csstools/postcss-cascade-layers": "5.0.2",
+    "@tailwindcss/vite": "4.3.3",
+    "@types/node": "26.6.4",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "postcss": "8.5.29",
+    "tailwindcss": "4.3.3",
+    "typescript": "6.0.3",
+    "vite": "8.3.3"
+  }
+}

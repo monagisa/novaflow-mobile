@@ -1,0 +1,203 @@
+// 开发包范围与原生助手准备守卫，确认安装声明包含实际运行的完整产物。
+'use strict';
+
+/**
+ * 守卫：开发机同步脚本（`scripts/reload-dev.mjs`）到底把哪些文件装进 profile。
+ *
+ * 两层坑：脚本只收 `lib/` 下的 js/cjs/mjs 时，**面板产物**（`lib/panel/index.html`）、`lib`
+ * 各子目录里的 `package.json`（那几个目录的 `"type": "commonjs"` 声明）、
+ * `config/agent-presets` 的 preset、`cordis.mobile-host.yml`、`host.js`、内联的凭据包全都
+ * 推不过去，改完这些再同步界面一点变化都没有，而脚本还报「已就地重新装载」；而装进去的东西
+ * **不是 profile 声明的产物**时，重启 DSH 按声明重装一遍，装回来的又是旧快照。
+ *
+ * 默认那条路的判据是**包自己的 `files` 白名单**（`npm pack --dry-run` 说了算），所以这里钉
+ * 三件事：清单必须收住运行时要读的每一类文件（实现、面板产物、子目录声明、preset、yml、
+ * 凭据库、`host.js`）；清单必须排掉构建源码、测试、脚本、依赖、tgz 与锁文件；脚本必须真的
+ * 走「打包 + 依赖声明改写 + 运行时 pnpm install」这套动作，不能悄悄退回逐文件拷贝。
+ *
+ * 运行：node --test test/reload-dev-scope.test.cjs
+ */
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const test = require('node:test');
+const { execFileSync } = require('node:child_process');
+const os = require('node:os');
+const vm = require('node:vm');
+
+const PLUGIN_ROOT = path.join(__dirname, '..');
+const SCRIPT = path.join(PLUGIN_ROOT, 'scripts', 'reload-dev.mjs');
+
+/** 脚本是 ESM、且只在跑 `main()` 时才有副作用；读源码取常量比 import 它更稳。 */
+const source = fs.readFileSync(SCRIPT, 'utf8');
+
+/** 包清单：直接问 npm，别在这里再抄一份 `files` 规则（抄一份就是第二份实现）。 */
+function packedFiles() {
+  const raw = execFileSync('npm', ['pack', '--dry-run', '--json'], {
+    cwd: PLUGIN_ROOT,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const parsed = JSON.parse(raw);
+  const list = Array.isArray(parsed) ? parsed[0]?.files : parsed?.files;
+  assert.ok(Array.isArray(list), 'npm pack --dry-run --json 没给出文件清单');
+  return list.map(item => item.path);
+}
+
+const FILES = packedFiles();
+const has = rel => FILES.includes(rel);
+
+test('开发包准备只复制本机现有助手，演练与缺失产物不写文件', () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-dev-native-'));
+  const plugin = path.join(workspace, 'dsh-mobile-plugin');
+  const marker = path.join(workspace, 'tailcat-host', 'runtime-version.json');
+  const nativeSource = path.join(workspace, 'build', 'tailcat-runtime', 'darwin-arm64', 'dsh-tailcat-host');
+  const target = path.join(plugin, 'native', 'darwin-arm64', 'dsh-tailcat-host');
+  const messages = [];
+  const start = source.indexOf('function prepareDevNative(');
+  const end = source.indexOf('\n/**', start);
+  assert.ok(start > 0 && end > start, '开发包必须先准备本机助手');
+  const prepare = vm.runInNewContext(`(${source.slice(start, end)})`, { fs, path, say: message => messages.push(message) });
+  try {
+    fs.mkdirSync(plugin, { recursive: true });
+    fs.mkdirSync(path.dirname(marker), { recursive: true });
+    fs.writeFileSync(marker, '{}');
+    assert.equal(prepare(plugin, false, 'darwin-arm64'), null, '缺少build时不阻塞其他线路');
+    fs.mkdirSync(path.dirname(nativeSource), { recursive: true });
+    fs.writeFileSync(nativeSource, 'compiled-helper');
+    // 返回的是写入的产物路径数组，不是单个路径：开发包现在同时收隧道助手与远程电脑桌面壳，
+    // 两类原生产物各自一条。这里只有本机助手，所以数组里就它一个。
+    // 函数在 vm 沙箱里跑，返回的数组来自另一个 realm，deepStrictEqual 会因原型不同判不等，
+    // 因此按「长度 + 元素」比较。
+    const dryRunWritten = prepare(plugin, true, 'darwin-arm64');
+    assert.equal(dryRunWritten.length, 1, '只有本机助手时数组长度为 1');
+    assert.equal(dryRunWritten[0], target, '数组里是本机助手的路径');
+    assert.equal(fs.existsSync(target), false, 'dry-run不得写native产物');
+    assert.ok(messages.some(message => message.includes('演练')));
+    const realWritten = prepare(plugin, false, 'darwin-arm64');
+    assert.equal(realWritten.length, 1, '只有本机助手时数组长度为 1');
+    assert.equal(realWritten[0], target, '数组里是本机助手的路径');
+    assert.equal(fs.readFileSync(target, 'utf8'), 'compiled-helper');
+    assert.equal(fs.statSync(target).mode & 0o111, 0o111);
+    assert.match(source, /function packedFiles\(\)\s*\{\s*prepareDevNative\(\)/, '复制必须在npm清单计算之前');
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('本机已准备的隧道助手会纳入开发包', () => {
+  const platform = `${process.platform}-${process.arch}`;
+  const name = platform === 'win32-x64' ? 'dsh-tailcat-host.exe' : 'dsh-tailcat-host';
+  const rel = `native/${platform}/${name}`;
+  const manifest = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, 'package.json'), 'utf8'));
+  assert.ok(manifest.files.includes('native/**'), '主包白名单必须允许开发原生产物');
+  if (fs.existsSync(path.join(PLUGIN_ROOT, rel))) assert.ok(has(rel), '已准备的助手必须真实出现在npm打包清单');
+});
+
+test('包清单收住了实现、面板产物与子目录声明', () => {
+  for (const rel of ['lib/impl.js', 'lib/panel/index.html', 'lib/routes/package.json']) {
+    assert.ok(has(rel), `${rel} 必须在包里`);
+  }
+});
+
+test('宿主运行时要读的那些非 js 文件也在包里（缺了就是「改了没生效」）', () => {
+  for (const rel of [
+    'cordis.patch.yml',
+    'cordis.mobile-host.yml',
+    'config/agent-presets/standard/agent.cordis.yml',
+    'config/agent-presets/standard/preset.yml',
+    'host.js',
+    'package.json',
+    'dsh-mobile-credentials/lib/credentials.js',
+    'dsh-mobile-credentials/package.json',
+  ]) {
+    assert.ok(has(rel), `${rel} 必须在包里`);
+  }
+});
+
+test('构建源码、测试、脚本、依赖与打包产物不进包', () => {
+  assert.ok(!FILES.some(rel => rel.startsWith('React/')), 'React/ 是构建源码，不随实现走');
+  assert.ok(!FILES.some(rel => rel.startsWith('test/')), 'test/ 不进包');
+  assert.ok(!FILES.some(rel => rel.startsWith('scripts/')), 'scripts/ 不进包');
+  assert.ok(!FILES.some(rel => rel.includes('node_modules')), '依赖不进包');
+  assert.ok(!FILES.some(rel => rel.endsWith('.tgz')), '打包产物不进包');
+  assert.ok(!has('pnpm-lock.yaml'), 'profile 有自己的锁文件，别覆盖它');
+});
+
+test('包清单里不存在会跳出包根的意外路径', () => {
+  const dangerous = FILES.filter(rel => rel.startsWith('..') || path.isAbsolute(rel));
+  assert.deepEqual(dangerous, [], '包清单里不许出现跳出包根的路径');
+});
+
+test('默认那条路必须走打包 + 改依赖声明 + 运行时 pnpm 安装', () => {
+  // 这三样缺一条，重启就会退回旧快照：只拷文件 → 安装不是声明的产物；不打进 profile →
+  // 安装读不到那一份；不用运行时 pnpm → 布局与锁文件格式对不上。
+  assert.match(source, /execFileSync\('npm', \['pack', '--pack-destination'/, '默认路要真的打包');
+  assert.match(source, /pointDeclarationAt/, '默认路要把依赖声明指到刚打出来的那一份');
+  assert.match(source, /'install', '--no-frozen-lockfile'/, '默认路要用 pnpm 更新锁文件后安装');
+  assert.match(source, /runtimePnpm\(\)/, '默认路要用运行时自带那个 pnpm');
+  assert.match(source, /reload-implementation/, '两条路都要触发就地重载');
+});
+
+test('前端源码比面板产物新时必须先重建，再打包安装（别把旧页面装进 profile）', () => {
+  // 判据是修改时间而不是「调用方有没有提醒」：React/src 比 lib/panel/index.html 新就重建。
+  assert.match(source, /function panelIsStale\(\)/, '没有「产物是否比源码旧」的判据');
+  assert.match(source, /newestMtime/, '没有按前端源码的修改时间判');
+  assert.match(source, /'run', 'build'/, '没有自动重建面板');
+  assert.match(source, /面板构建失败/, '构建失败必须停下，不能把旧产物装进去');
+
+  // 顺序也是契约：重建 → 打包 → 安装 → 重载。反了就等于拿上一份产物去装。
+  const main = source.slice(source.indexOf('async function main()'));
+  const staleAt = main.indexOf('panelIsStale()');
+  const installAt = main.indexOf('installPackedPackage()');
+  assert.ok(staleAt > 0, 'main 里没用陈旧判据');
+  assert.ok(installAt > 0, 'main 里没走默认安装路');
+  assert.ok(staleAt < installAt, '必须先判断（必要时重建）面板，再打包安装');
+});
+
+test('--only 只收包白名单里的路径：构建源码 / 测试 / 包外的东西当场拒掉', () => {
+  // 真的跑一次脚本（对着一个临时 DSH_HOME 里的假 profile），断言的是一条真实行为：
+  // 不在包白名单里的路径（这里是 React 构建源码）必须以非零退出，且把原因说出来。
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-reload-scope-'));
+  const profile = path.join(home, 'profiles', 'desktop');
+  const target = path.join(profile, 'node_modules', 'dsh-mobile-plugin');
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.cpSync(PLUGIN_ROOT, target, {
+    recursive: true,
+    filter: source => !source.includes(`${path.sep}node_modules`),
+  });
+  fs.writeFileSync(
+    path.join(profile, 'package.json'),
+    `${JSON.stringify({ name: 'dsh-profile-desktop', dependencies: { 'dsh-mobile-plugin': 'file:dsh-mobile-plugin-0.0.0.tgz' } }, null, 2)}\n`,
+  );
+
+  const runScript = extra => {
+    try {
+      const stdout = execFileSync(process.execPath, [SCRIPT, ...extra], {
+        cwd: PLUGIN_ROOT,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, DSH_HOME: home },
+      });
+      return { code: 0, out: stdout };
+    } catch (error) {
+      return { code: error.status ?? 1, out: `${error.stdout ?? ''}${error.stderr ?? ''}` };
+    }
+  };
+
+  try {
+    const outside = runScript(['--only', 'React/src/demo/host.ts', '--dry-run']);
+    assert.notEqual(outside.code, 0, 'React/ 里的文件不在包白名单里，必须拒掉');
+    assert.match(outside.out, /白名单/, '拒掉时要说明原因（不在包白名单里）');
+
+    const missing = runScript(['--only', 'lib/pack-excludes-me.js', '--dry-run']);
+    assert.notEqual(missing.code, 0, '仓库里没有的路径必须拒掉');
+    assert.match(missing.out, /仓库里没有这个文件/);
+
+    const inside = runScript(['--only', 'lib/impl.js', '--dry-run']);
+    assert.equal(inside.code, 0, '包里有的文件要能走这条快路');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

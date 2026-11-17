@@ -1,0 +1,242 @@
+'use strict'
+// 「状态不许由过期的隧道实例改写」。
+//
+// 成因：worker 的 startTunnel() 里，onClose / onPairRequest / start().catch 都带实例身份
+// 守卫（tunnel === current），只有 onRegistered 漏了。注册帧是在 ws 上异步回来的，只要在这
+// 期间 configure() 或网络监视器重建了隧道，旧实例迟到的 registered 帧就会把 tunnelState 写
+// 成 'connected' —— 可此刻 tunnel 指向的是新实例，它的 ws 还停在 CONNECTING，connected 是
+// false。
+//
+// 于是形成这个错位：/status 说「已连接」→ 宿主据此放行镜像推送 → worker 按真值回 503 tunnel
+// not connected。状态越乐观，推送越是必然失败，而且没有任何补偿手段。
+//
+// 本用例把 openTunnel() / startTunnel() 的**真源码**抠出来 eval，配上假的 RelayTunnel 驱动
+// 那条时序 —— 测的是真代码，不是照着真代码另写一遍（后者会在真代码坏掉时照样绿灯）。
+// 建隧道那段之所以在 openTunnel() 里：换中转地址时新隧道要**在旧隧道还开着的时候**起来
+// （见 lib/relay/migrate.js），所以它不能再被 startTunnel 的 stopTunnel() 包着。
+const assert = require('node:assert/strict')
+const { readFileSync } = require('node:fs')
+const { join } = require('node:path')
+
+const worker = readFileSync(join(__dirname, '..', 'lib', 'sidecar-facade-worker.cjs'), 'utf8')
+
+// 切片从 `openTunnel(` 开始到 `startLan()` 之前：择路那三个函数（relayRoutePlan /
+// adoptRoute / raceTunnels）与 `startTunnel` 是同一条路，必须一起 eval —— 只抠
+// openTunnel 会让它依赖的 `raceTunnels` 在闭包里不存在。
+// 终点按行首切，不能直接用 `indexOf('function startLan(')`：它落在 `async ` 之后，
+// 会把 `async` 这个关键字单独剩在切片末尾，拼进 new Function 就成了「async 未定义」。
+// 从 `function startLan(` 往前退到行首，等于连 `async` 一起切掉。
+const START_TUNNEL_BODY = worker.slice(
+  worker.indexOf('function openTunnel('),
+  worker.lastIndexOf('\n', worker.indexOf('function startLan(')),
+)
+assert.ok(START_TUNNEL_BODY.length > 0, '应能在 worker 源码里定位 openTunnel() / startTunnel()')
+
+// 把真源码连同它依赖的模块级状态一起装进一个闭包：tunnel / tunnelState /
+// tunnelError 和 stopTunnel() 都按 worker 里的写法原样重建，这样 eval 出来的
+// startTunnel 跑的就是生产逻辑。
+function bootWorker() {
+  const instances = []
+  const log = { reconnects: 0, stopped: [], publishes: 0, resets: 0 }
+  class StubRelayTunnel {
+    constructor(opts) {
+      this.opts = opts
+      this.registered = false
+      this.stopped = false
+      instances.push(this)
+    }
+    // 真 start() 要等 registered 帧才 resolve；这里不 resolve——本用例要控制
+    // 「哪一帧在什么时候回来」，让 resolve 自然发生会把时序锁死。
+    start() { return new Promise(() => {}) }
+    stop() { this.stopped = true; log.stopped.push(this) }
+    sendPairConfirm() {}
+    // 让这一帧「回来」
+    deliverRegistered() { this.registered = true; this.opts.onRegistered() }
+  }
+  const api = new Function('deps', `
+    const { config, core, RelayTunnel, upstream, lanUrls, lanUrlPort, currentLanUrls, snapshotRead, parentJson, log, publishState, reconnect, markOutdated } = deps;
+    let tunnel = null;
+    let tunnelState = 'off';
+    let tunnelError = null;
+    let tunnelRoute = null;
+    let pendingAttempt = null;
+    // 与 lib/sidecar-facade-worker.cjs 的 stopTunnel() 逐行同义。
+    const stopTunnel = () => {
+      if (tunnel) tunnel.stop();
+      tunnel = null; tunnelState = 'off'; tunnelError = null;
+    };
+    const scheduleReconnect = () => { log.reconnects++ };
+    ${START_TUNNEL_BODY}
+    return {
+      startTunnel,
+      snapshot: () => ({ state: tunnelState, error: tunnelError }),
+      live: () => (tunnel && tunnel.registered ? 'open' : (tunnel ? 'connecting' : 'none')),
+    };
+  `)({
+    config: {
+      enabled: true, relayUrl: 'https://relay.invalid', instanceId: 'i1',
+      pairingCode: '123456', name: 'LAN Test', upstreamPort: 19387,
+      lanEnabled: true, lanSecret: 's',
+    },
+    core: { tunnelWsUrl: (u) => u, normalizeRelayUrl: (u) => String(u || '').trim(), signLanToken: () => 'tok', MOBILE_BEARER_TTL_SEC: 60 },
+    RelayTunnel: StubRelayTunnel,
+    upstream: () => ({}),
+    lanUrls: () => [],
+    lanUrlPort: () => 18787,
+    // startTunnel 里的局域网候选改走 worker 的 currentLanUrls()；按真源码的同名依赖注入。
+    currentLanUrls: () => [],
+    snapshotRead: async () => null,
+    parentJson: async () => ({ approved: false }),
+    // 重连退避账：连上之后必须清零（否则连续失败几次后就永远停在 30s 上）。
+    reconnect: { reset: () => { log.resets += 1 } },
+    log,
+    // worker 的 publishState()：状态跳变要立刻经 IPC 推给宿主，别等 10s 健康轮询。
+    // 这里只数调用次数；「推的是不是真状态」由下面的契约断言钉住。
+    publishState: () => { log.publishes += 1 },
+    // 「被中转按版本挡下来」那一档的入口（真实现见 sidecar-facade-worker 的 markOutdated，
+    // 它自己带实例身份闸）。这里不需要它，用例只看正常断线那条路。
+    markOutdated: () => false,
+  })
+  return { ...api, instances, log }
+}
+
+// ── 契约面：回调里凡是写状态的，往上都得有身份守卫 ──────────────────────────
+// 只看 new RelayTunnel({ 之后：它之前那行 stopTunnel(); tunnelState = 'connecting'
+// 本来就是新实例在宣告自己，没有「过期」可言，不该被要求带守卫。
+{
+  const lines = START_TUNNEL_BODY.split('\n')
+  const fromCallbacks = lines.findIndex((l) => l.includes('new RelayTunnel('))
+  assert.ok(fromCallbacks > 0, '应能定位到 new RelayTunnel(')
+  // 扫到 `function startTunnel()` 就停：那里面那句 `stopTunnel(); tunnelState = 'connecting'`
+  // 是新实例在宣告自己（旧代码里它就在 new RelayTunnel 之前），没有「过期」可言。
+  const untilStart = lines.findIndex((l, i) => i > fromCallbacks && l.includes('function startTunnel() {'))
+  const end = untilStart > 0 ? untilStart : lines.length
+  const writers = []
+  for (let i = fromCallbacks + 1; i < end; i += 1) {
+    const line = lines[i]
+    if (!/\btunnelState\s*=|\btunnelError\s*=/.test(line)) continue
+    // 守卫可以就在同一行（`onRegistered: () => { if (tunnel !== current) return; …`），
+    // 也可以是紧挨着的上一行。两处都算。
+    const near = `${lines[i - 1] || ''}${line}`
+    // `\btunnel\s` 而不是 `tunnel `：择路那笔账叫 `tunnelRoute`，它出现在 `onRegistered`
+    // 那一行的先头时不该被当成身份守卫（更要紧的是别被当成「有守卫」）。
+    writers.push({ line: i + 1, text: line.trim().slice(0, 58), guarded: /\btunnel\s*(===|!==)\s*current\b/.test(near) })
+  }
+  assert.ok(writers.length >= 3, `回调里应至少找到 3 处状态写入，实际 ${writers.length}`)
+  for (const w of writers) {
+    assert.ok(
+      w.guarded,
+      `第 ${w.line} 行在回调里写状态却没有实例身份守卫：${w.text}\n` +
+      '过期实例的回调一旦改状态，/status 就会撒谎，宿主据此放行的推送必然撞 503。',
+    )
+  }
+}
+
+// ── 行为面：旧实例迟到的 registered 不许污染状态 ────────────────────────────
+{
+  const w = bootWorker()
+
+  w.startTunnel()
+  const first = w.instances[0]
+  assert.equal(w.snapshot().state, 'connecting', '刚建实例时是 connecting')
+  assert.equal(w.live(), 'connecting', '底层 ws 还没 OPEN')
+
+  first.deliverRegistered()
+  assert.equal(w.snapshot().state, 'connected', '当前实例注册成功 → connected')
+  assert.equal(w.live(), 'open')
+
+  // configure() 或网络监视器重建隧道；旧实例必须被停掉
+  w.startTunnel()
+  const second = w.instances[1]
+  assert.equal(first.stopped, true, '重建时旧实例必须 stop()')
+  assert.equal(w.snapshot().state, 'connecting')
+  assert.equal(w.live(), 'connecting', '新实例的 ws 还没 OPEN，底层并未连上')
+
+  // 旧实例迟到的注册帧此刻才回来
+  first.deliverRegistered()
+  assert.equal(
+    w.snapshot().state,
+    'connecting',
+    '过期实例的注册帧不得把状态改成 connected：/status 一旦撒谎，宿主就会放行镜像推送并必然撞 503',
+  )
+
+  second.deliverRegistered()
+  assert.equal(w.snapshot().state, 'connected', '新实例真正注册成功后才算 connected')
+  assert.equal(w.snapshot().error, null)
+}
+
+// ── 行为面 2：断线必须由「当前」实例记账并安排重连 ──────────────────────────
+{
+  const w = bootWorker()
+  w.startTunnel()
+  const first = w.instances[0]
+  first.deliverRegistered()
+
+  w.startTunnel()
+  const second = w.instances[1]
+  second.deliverRegistered()
+
+  // 旧实例的 close 迟到：不得把刚连好的状态打成 error，也不得触发重连
+  first.opts.onClose(1006, 'stale')
+  assert.equal(w.snapshot().state, 'connected', '过期实例的断线不得覆盖当前状态')
+  assert.equal(w.log.reconnects, 0, '过期实例的断线不得安排重连，否则就是重连风暴')
+
+  // 当前实例真的断了：必须记账并安排重连
+  second.opts.onClose(1006, 'gone')
+  assert.equal(w.snapshot().state, 'error')
+  assert.equal(w.snapshot().error, '连接断开')
+  assert.equal(w.log.reconnects, 1)
+}
+
+// ── 契约面 2 + 行为面 3：状态跳变必须立刻上报，不等 10s 健康轮询 ──────────────
+// 轮询是权威但滞后：隧道真断之后宿主最多 10s 仍认为已连接，期间照常推镜像，每次撞
+// sidecar-facade 的 5s 超时，该会话的单飞门被占住，事件只能合并成一次补推。所以
+// worker 的每一个状态写入点都必须顺手 publishState()。
+{
+  const define = worker.slice(worker.indexOf('function publishState() {'), worker.indexOf('function send(res, code, value) {'))
+  assert.ok(define.includes('type: \'state\''), 'publishState 必须发一条 type=state 的 IPC 消息')
+  // 三个字段缺一不可；`route` 是这一轮择路的账（可选、在状态字段之后展开），
+  // 所以正则以那三个字段打头、不把右括号钉死。
+  assert.match(define, /tunnel: \{ state: tunnelState, error: tunnelError, mirror: relayMirror/, '状态消息必须带真实 tunnel 状态（含对端存不存镜像的口径）')
+  assert.match(define, /process\.send\?\.\(/, '必须走 IPC（没有父进程时要能静默跳过）')
+  // 三处状态跳变（connecting / connected / error）都得上报，少一处就回到「滞后 10s」。
+  const publishes = START_TUNNEL_BODY.match(/publishState\(\)/g) || []
+  assert.ok(publishes.length >= 3, `startTunnel 里应至少 3 处 publishState()，实际 ${publishes.length}`)
+}
+{
+  const w = bootWorker()
+  w.startTunnel()
+  assert.equal(w.log.publishes, 1, '建实例（connecting）就该上报一次')
+  const first = w.instances[0]
+  first.deliverRegistered()
+  assert.equal(w.log.publishes, 2, '注册成功（connected）必须立刻上报')
+  assert.equal(w.snapshot().state, 'connected')
+
+  // 过期实例的帧不该上报：上报的是状态，状态本身没变，多报一次就是让宿主白补推一轮。
+  w.startTunnel()
+  assert.equal(w.log.publishes, 3, '重建（connecting）上报')
+  first.deliverRegistered()
+  assert.equal(w.log.publishes, 3, '过期实例的注册帧不得上报状态跳变')
+  assert.equal(w.log.resets, 1, '过期实例的注册帧不得清掉重连退避账（清了就等于放过一次重连风暴）')
+
+  const second = w.instances[1]
+  second.deliverRegistered()
+  assert.equal(w.log.publishes, 4, '新实例真正连上才上报 connected')
+  assert.equal(w.log.resets, 2, '当前实例注册成功必须清账，否则连错几次后永远停在 30s 退避上')
+  second.opts.onClose(1006, 'gone')
+  assert.equal(w.log.publishes, 5, '断线必须立刻上报 error（宿主据此停止推镜像，而不是再撞 10s 超时）')
+}
+
+// 中途被关掉（enabled 转 false）那一条早退必须把这笔择路账清掉。
+//
+// `pendingAttempt` 的用途是「还在等这一次注册结果，所以 onClose 闭嘴」。留着它不请，
+// 那条隧道的 close 会被当成「还在等」，于是下一次真正的掉线报不出来 —— 状态永远停在
+// connecting，宿主不再推镜像，手机上看到的是「一直连不上」而没有任何错误。
+{
+  const source = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'lib', 'sidecar-facade-worker.cjs'), 'utf8');
+  const body = source.slice(source.indexOf('async function raceTunnels('), source.indexOf('function startLan() {'));
+  assert.match(body, /if \(!config\.enabled\)\s*\{\s*pendingAttempt = null;\s*return false\s*\}/,
+    'enabled 转 false 的早退必须清掉 pendingAttempt，否则下一次真实掉线会被 onClose 静默吞掉');
+}
+
+console.log('tunnel state guard tests passed')

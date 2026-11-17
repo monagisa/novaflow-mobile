@@ -1,0 +1,362 @@
+// 入口恢复和能力更新必须在信封验签通过之后记账。
+'use strict';
+
+/**
+ * 协议 v2 信封的端到端守卫（§8.3(4)(7)(11)）。
+ *
+ * 直接驱动真实实现：App 侧（`app/src/api/envelope.ts` + `services/e2ee-envelope.ts`）
+ * 封一条请求，喂进宿主侧的 \`createGuarded\`，再解回响应。中间不转写任何逻辑 ——
+ * 「两端各看各的代码都像对的、合起来解不开」是这一层最典型的翻车方式。
+ *
+ * 钉住这七条：
+ *  1. 一条正常请求能走完「封 → 验签 → 解 → 业务 → 封响应 → 解响应」；
+ *  2. `X-Dsh-Sig` 对不上就 400 `e2ee-bad-signature`，且 handler 不被调用；
+ *  3. 时钟超窗回 400 `e2ee-clock-skew` + `serverTime`（**明文**，否则 App 读不到原因）；
+ *  4. 同一 nonce 的写请求第二次进来回 409 `e2ee-replay`；
+ *  5. GET 复用同一 nonce 不算重放（换通道重投就是这个形状）;
+ *  6. 未知 keyId 回 401 `e2ee-unknown-device`（明文）；
+ *  7. `401/403/503` 的响应不加密；
+ *  8. 重放表超过软上限时只淘汰过期项，窗口内最早的 nonce 重投仍判 `e2ee-replay`。
+ *
+ * 运行：`node dsh-mobile-plugin/test/e2ee-envelope-e2e.test.cjs`
+ */
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const path = require('node:path');
+const { PassThrough } = require('node:stream');
+
+const root = path.join(__dirname, '..');
+const routing = require(path.join(root, 'lib/http/routing.js'));
+const e2ee = require(path.join(root, 'lib/shared/e2ee.js'));
+
+const DEVICE_KEY = Buffer.alloc(32, 0x22);
+const KEY_ID = '0011223344556677';
+const INSTANCE = 'a1b2c3d4';
+const keys = e2ee.deriveSessionKeys(DEVICE_KEY);
+
+/** 假 IncomingMessage：能按信封要求读 body。 */
+function fakeReq({ method = 'POST', url = '/api/mobile/v1/status', headers = {}, body = '' } = {}) {
+  const stream = new PassThrough();
+  const req = {
+    method,
+    url,
+    headers,
+    socket: { remoteAddress: '127.0.0.1' },
+    on: stream.on.bind(stream),
+    destroy: () => stream.destroy(),
+  };
+  stream.resume();
+  process.nextTick(() => {
+    if (body) stream.write(body);
+    stream.end();
+  });
+  return req;
+}
+
+/** 假 ServerResponse：记录状态与最终写出的字节。 */
+function fakeRes() {
+  const res = {
+    statusCode: 0,
+    headers: {},
+    written: '',
+    writeHead(status, extra) {
+      res.statusCode = status;
+      Object.assign(res.headers, extra || {});
+      return res;
+    },
+    end(chunk) {
+      res.written = chunk == null ? '' : String(chunk);
+      return res;
+    },
+  };
+  return res;
+}
+
+const guarded = routing.createGuarded(
+  {},
+  () => true,
+  null,
+  {
+    envelope: {
+      keyFor: (keyId) => (keyId === KEY_ID ? { deviceKey: DEVICE_KEY.toString('base64url'), deviceId: 'dev-1' } : null),
+      // 与 `lib/shared/e2ee-request.js` 的 `readRawBody` 同形状：超限或连接出错都 reject。
+      readBody: (req) =>
+        new Promise((resolve, reject) => {
+          const chunks = [];
+          req.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+          req.on('end', () => resolve(Buffer.concat(chunks)));
+          req.on('error', reject);
+        }),
+    },
+  },
+);
+
+/**
+ * 按 App 的口径封一条请求。
+ *
+ * 这里用的是宿主侧的 `lib/shared/e2ee.js`，而不是 App 那份 .ts —— 后者是 ESM+TS，CJS 测试
+ * 里加载不了。两端口径一致这件事由 `app/scripts/test-e2ee-vectors.js` 逐字节证明过，
+ * 所以这里用哪一份封都不影响判据：这条测试要证的是**接线**（信封放哪、什么时候验签、
+ * 错误码对不对），字节口径已经有独立的守卫。
+ */
+function buildRequest({ method = 'POST', path = '/api/mobile/v1/status', query = '', plain = { v: 1 }, ts = Date.now(), nonce = null }) {
+  const nonceBytes = nonce || Buffer.alloc(12, 0x44);
+  const nonceText = e2ee.b64url(nonceBytes);
+  // `plain === null` 就是「没有 body」：GET 走这条，签名摘要按**空字节**算（与 App 侧一致）。
+  const bodyBytes = plain === null ? Buffer.alloc(0) : Buffer.from(JSON.stringify(plain), 'utf8');
+  const sealed = e2ee.sealWithNonce(keys.up, nonceBytes, bodyBytes, e2ee.upAad(method, path));
+  const wire = plain === null ? '' : JSON.stringify({ v: 2, c: Buffer.from(sealed).toString('base64') });
+  const canonical = e2ee.canonicalString({
+    method,
+    path,
+    query,
+    ts,
+    nonce: nonceText,
+    bodyBytes: wire === '' ? Buffer.alloc(0) : Buffer.from(wire, 'utf8'),
+  });
+  return {
+    wire,
+    headers: {
+      'x-dsh-proto': '2',
+      'x-dsh-key-id': KEY_ID,
+      'x-dsh-ts': String(ts),
+      'x-dsh-nonce': nonceText,
+      'x-dsh-sig': e2ee.sign(keys.sig, canonical),
+    },
+  };
+}
+
+test('正常一条请求：封 → 验签 → 解 → 业务 → 封响应 → 解响应', async () => {
+  const built = buildRequest({ plain: { hello: '世界' }, nonce: Buffer.alloc(12, 0x01) });
+  let received = null;
+  const handler = guarded(async (_ctx, req, res) => {
+    received = req.body;
+    routing.sendJson(res, 200, { ok: true, echo: req.body.hello });
+  });
+  const req = fakeReq({ headers: built.headers, body: built.wire });
+  const res = fakeRes();
+  await handler(req, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(received, { hello: '世界' }, '业务 handler 必须拿到明文');
+
+  const wire = JSON.parse(res.written);
+  assert.equal(wire.v, 2, '响应必须是信封');
+  assert.equal(typeof wire.n, 'string');
+  assert.equal(typeof wire.c, 'string');
+
+  const nonce = req.headers['x-dsh-nonce'];
+  const ts = Number(req.headers['x-dsh-ts']);
+  const { unwrapper } = require(path.join(root, 'lib/shared/e2ee-request.js'));
+  const plain = JSON.parse(
+    e2ee.open(keys.down, unwrapper(wire), e2ee.downAad('POST', '/api/mobile/v1/status', ts, nonce)).toString('utf8'),
+  );
+  assert.deepEqual(plain, { ok: true, echo: '世界' }, 'App 侧必须能解回业务结果');
+});
+
+test('签名对不上：400 e2ee-bad-signature，handler 不被调用、响应明文', async () => {
+  const built = buildRequest({ plain: { a: 1 }, nonce: Buffer.alloc(12, 0x02) });
+  const bad = { ...built, headers: { ...built.headers, 'x-dsh-sig': e2ee.b64url(Buffer.alloc(32, 0)) } };
+  let called = false;
+  const handler = guarded(async () => { called = true; });
+  const res = fakeRes();
+  await handler(fakeReq({ headers: bad.headers, body: bad.wire }), res);
+  assert.equal(called, false);
+  assert.equal(res.statusCode, 400);
+  assert.equal(JSON.parse(res.written).error.code, 'e2ee-bad-signature');
+});
+
+test('时钟超窗：400 e2ee-clock-skew + serverTime，且响应明文', async () => {
+  const built = buildRequest({ plain: { a: 1 }, nonce: Buffer.alloc(12, 0x03), ts: Date.now() - 30 * 60 * 1000 });
+  const handler = guarded(async () => { throw new Error('不该被调用'); });
+  const res = fakeRes();
+  await handler(fakeReq({ headers: built.headers, body: built.wire }), res);
+  assert.equal(res.statusCode, 400);
+  const body = JSON.parse(res.written);
+  assert.equal(body.error.code, 'e2ee-clock-skew');
+  assert.ok(typeof body.error.serverTime === 'number', '必须带宿主的时钟，否则手机无从校准');
+  assert.equal(body.v, undefined, '这条响应不能是信封：App 要先读懂它');
+});
+
+test('同一 nonce 的写请求第二次：409 e2ee-replay', async () => {
+  const nonce = Buffer.alloc(12, 0x66);
+  const handler = guarded(async (_ctx, _req, res) => routing.sendJson(res, 200, { ok: true }));
+  const built = buildRequest({ plain: { a: 1 }, nonce, ts: Date.now() });
+  await handler(fakeReq({ headers: built.headers, body: built.wire }), fakeRes());
+  const second = buildRequest({ plain: { a: 1 }, nonce, ts: Date.now() });
+  const res = fakeRes();
+  await handler(fakeReq({ headers: second.headers, body: second.wire }), res);
+  assert.equal(res.statusCode, 409);
+  assert.equal(JSON.parse(res.written).error.code, 'e2ee-replay');
+});
+
+test('GET 复用同一 nonce 不算重放（换通道重投就是这个形状）', async () => {
+  const nonce = Buffer.alloc(12, 0x77);
+  const handler = guarded(async (_ctx, _req, res) => routing.sendJson(res, 200, { ok: true }));
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const built = buildRequest({ method: 'GET', plain: null, nonce, ts: Date.now() });
+    const res = fakeRes();
+    await handler(fakeReq({ method: 'GET', headers: built.headers, body: '' }), res);
+    assert.equal(res.statusCode, 200, `第 ${attempt + 1} 次 GET 不该被判重放`);
+  }
+});
+
+test('未知 keyId：401 e2ee-unknown-device，明文', async () => {
+  const built = buildRequest({ plain: { a: 1 }, nonce: Buffer.alloc(12, 0x04) });
+  const unknown = { ...built, headers: { ...built.headers, 'x-dsh-key-id': 'ffffffffffffffff' } };
+  const handler = guarded(async () => { throw new Error('不该被调用'); });
+  const res = fakeRes();
+  await handler(fakeReq({ headers: unknown.headers, body: unknown.wire }), res);
+  assert.equal(res.statusCode, 401);
+  const body = JSON.parse(res.written);
+  assert.equal(body.error.code, 'e2ee-unknown-device');
+  assert.equal(body.v, undefined, '401 必须明文');
+});
+
+test('业务层的 401 响应不加密', async () => {
+  const built = buildRequest({ plain: { a: 1 }, nonce: Buffer.alloc(12, 0x05) });
+  const handler = guarded(async (_ctx, _req, res) => {
+    routing.sendJson(res, 401, { ok: false, error: { code: 'device-revoked', message: '已解除绑定' } });
+  });
+  const res = fakeRes();
+  await handler(fakeReq({ headers: built.headers, body: built.wire }), res);
+  assert.equal(res.statusCode, 401);
+  const body = JSON.parse(res.written);
+  assert.equal(body.v, undefined, '被吊销必须让 App 直接读懂');
+  assert.equal(body.error.code, 'device-revoked');
+});
+
+test('低速请求体的连接不会把守卫挂死（读体失败回 413 而不是永远等）', async () => {
+  const built = buildRequest({ plain: { a: 1 }, nonce: Buffer.alloc(12, 0x06) });
+  const stream = new PassThrough();
+  stream.resume();
+  const req = {
+    method: 'POST',
+    url: '/api/mobile/v1/status',
+    headers: built.headers,
+    socket: { remoteAddress: '127.0.0.1' },
+    on: stream.on.bind(stream),
+    destroy: () => stream.destroy(new Error('too large')),
+  };
+  const handler = guarded(async () => { throw new Error('不该被调用'); });
+  const res = fakeRes();
+  process.nextTick(() => stream.destroy(new Error('too large')));
+  await handler(req, res);
+  assert.equal(res.statusCode, 413, '读体失败必须是 413，不能挂住');
+});
+
+test('凭据是 v2 配的但请求没带 X-Dsh-Proto：400 e2ee-required，而不是含糊的 JSON 错', async () => {
+  // 模拟中转把 `X-Dsh-Proto` 删掉：这条请求在宿主眼里就是「一个老形状的明文请求」，
+  // 而它的凭据记录里明明有 deviceKey —— 那是被动降级的形状，必须说出来。
+  const built = buildRequest({ plain: { a: 1 }, nonce: Buffer.alloc(12, 0x09) });
+  const headers = { ...built.headers };
+  delete headers['x-dsh-proto'];
+  delete headers['x-dsh-sig'];
+  let called = false;
+  const handlers = routing.createGuarded({}, () => ({ ok: true, record: { deviceId: 'dev-1', deviceKey: 'x' } }), null, {
+    envelope: { keyFor: () => null, readBody: async () => Buffer.alloc(0) },
+  });
+  const res = fakeRes();
+  await handlers(async () => { called = true; })(fakeReq({ headers, body: built.wire }), res);
+  assert.equal(called, false, 'handler 不该被调用');
+  assert.equal(res.statusCode, 400);
+  assert.equal(JSON.parse(res.written).error.code, 'e2ee-required');
+});
+
+test('原生后台服务的 /monitor 不再免信封：v2 凭据不带信封一律 400', async () => {
+  // 原生侧已经自己封 v2（app/android/.../DeviceEnvelope.kt）：宿主这侧的临时口子收掉，
+  // 否则那条「只读状态位」会变成一条长期存在的明文旁路。
+  const handlers = routing.createGuarded({}, () => ({ ok: true, record: { deviceId: 'dev-1', deviceKey: 'x' } }), null, {
+    envelope: { keyFor: () => null, readBody: async () => Buffer.alloc(0) },
+  });
+  const plainHeaders = { cookie: 'c', authorization: 'Bearer t', 'x-dsh-instance': INSTANCE, 'x-dsh-device': 'dev-1' };
+  for (const url of ['/api/mobile/v1/monitor', '/api/mobile/v1/sessions?fresh=1']) {
+    let called = false;
+    const res = fakeRes();
+    await handlers(async () => { called = true; })(fakeReq({ method: 'GET', url, headers: plainHeaders }), res);
+    assert.equal(called, false, `${url} 不该被放行`);
+    assert.equal(res.statusCode, 400);
+    assert.equal(JSON.parse(res.written).error.code, 'e2ee-required');
+  }
+});
+
+/**
+ * 重放表清理只淘汰**真正过期**的 nonce，不按数量硬删。
+ *
+ * 这是「超过软上限后仍把窗口内的 nonce 删掉」那个回归的守卫：单设备连续写满一整个窗口、
+ * 把表撑过上限后，最早那枚 nonce 还在 5 分钟内，重投必须仍然被判重放。旧写法在循环里
+ * 带着 `table.size > NONCE_TABLE_SIZE` 一路删到 256 条，会把最早的那枚删掉，让重投溜过去。
+ *
+ * 用独立的 keyId（`BULK_KEY_ID`），不污染其它用例共享的 nonce 表。
+ */
+test('重放表超过软上限也只淘汰过期项：窗口内最早的 nonce 重投仍判 e2ee-replay', async () => {
+  const { openRequest, NONCE_TABLE_SIZE, evictExpiredNonces } = require(path.join(root, 'lib/shared/e2ee-request.js'));
+  const BULK_KEY_ID = 'bulk-replay-device';
+  const deps = {
+    keyFor: (keyId) =>
+      keyId === BULK_KEY_ID ? { deviceKey: DEVICE_KEY.toString('base64url'), deviceId: 'dev-bulk' } : null,
+  };
+
+  // 12 字节 nonce，低 4 字节放序号 —— 保证 total > 256 条仍两两不同。
+  const mkNonce = (i) => {
+    const b = Buffer.alloc(12);
+    b.writeUInt32BE(i >>> 0, 8);
+    return b;
+  };
+  const ts = Date.now();
+  const total = NONCE_TABLE_SIZE + 50;
+
+  for (let i = 0; i < total; i += 1) {
+    const built = buildRequest({ plain: { a: 1 }, nonce: mkNonce(i), ts });
+    built.headers['x-dsh-key-id'] = BULK_KEY_ID;
+    const out = openRequest(fakeReq({ headers: built.headers, body: built.wire }), deps, Buffer.from(built.wire, 'utf8'));
+    assert.equal(out.ok, true, `第 ${i} 条写请求应通过`);
+  }
+
+  // 重投最早那枚（仍在 5 分钟窗口内）：必须判重放，说明没有被上限清理误删。
+  const replay = buildRequest({ plain: { a: 1 }, nonce: mkNonce(0), ts });
+  replay.headers['x-dsh-key-id'] = BULK_KEY_ID;
+  const out = openRequest(
+    fakeReq({ headers: replay.headers, body: replay.wire }),
+    deps,
+    Buffer.from(replay.wire, 'utf8'),
+  );
+  assert.equal(out.ok, false, '窗口内最早的 nonce 被删了 → 重投被当成新请求放行了');
+  assert.equal(out.code, 'e2ee-replay');
+
+  // 纯函数侧：同样规模的窗口内表，一条都不删；只有真正过期的才删。
+  const table = new Map();
+  for (let i = 0; i < total; i += 1) table.set(`n${i}`, ts);
+  evictExpiredNonces(table, ts);
+  assert.equal(table.size, total, '都在窗口内，不应删任何一条');
+  assert.equal(table.has('n0'), true, '最早那条必须保留');
+
+  const mixed = new Map([
+    ['fresh', ts],
+    ['stale', ts - 6 * 60 * 1000],
+  ]);
+  evictExpiredNonces(mixed, ts);
+  assert.equal(mixed.has('fresh'), true, '窗口内的不许删');
+  assert.equal(mixed.has('stale'), false, '过期的必须删');
+});
+
+test('无效信封不记设备恢复，有效信封只记一次', async () => {
+  let noted = 0;
+  const guarded = routing.createGuarded({}, () => true, null, {
+    onAuthorized: () => { noted += 1; },
+    envelope: {
+      keyFor: keyId => keyId === KEY_ID ? { deviceKey: DEVICE_KEY.toString('base64url'), deviceId: 'dev-1' } : null,
+      readBody: req => Promise.resolve(req.raw),
+    },
+  });
+  const built = buildRequest({ plain: null, method: 'GET', nonce: Buffer.alloc(12, 0x71) });
+  const bad = fakeReq({ method: 'GET', headers: { ...built.headers, 'x-dsh-sig': 'invalid' } });
+  bad.raw = Buffer.alloc(0);
+  await guarded(async () => {})(bad, fakeRes());
+  assert.equal(noted, 0);
+  const good = fakeReq({ method: 'GET', headers: built.headers });
+  good.raw = Buffer.alloc(0);
+  await guarded(async (_ctx, _req, res) => routing.sendJson(res, 200, { ok: true }))(good, fakeRes());
+  assert.equal(noted, 1);
+});

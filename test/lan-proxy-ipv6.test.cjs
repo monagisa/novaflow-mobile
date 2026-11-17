@@ -1,0 +1,322 @@
+'use strict'
+// 监听关闭必须完成，端口冲突不在代理层自行迁移。
+
+/**
+ * 直连监听的 IPv6 守卫：宿主过去只在 `0.0.0.0` 上听，手机不在同一个 Wi-Fi 里、只有 IPv6
+ * 时拨不进来。现在 IPv4 那条原样保留，另起一条 `::` + `ipv6Only` 的监听接同一个端口。
+ * 这份测试启动**真实的 lan-proxy**，钉三件读代码看不出来的事：
+ *
+ *   1. 同一个实例上 IPv4（`127.0.0.1`）与 IPv6（`::1`）两边都通，且走到同一条 handler；
+ *   2. 首选端口被占而退到内核端口时，IPv6 那条跟着**实绑**端口走，不守着那个没人监听的号；
+ *   3. 配对接口收口：来源是原生全球单播 IPv6 时按「配对码错误」回（JSON、非 2xx，
+ *      不暴露接口存在性、也不惊动桌面端授权），而 IPv4 来源照旧走完整个配对流程 ——
+ *      公网 IPv4 直连配对是现有受支持用法（二维码里带 IPv4 候选），不能被一起拦掉。
+ */
+
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const http = require('node:http')
+const net = require('node:net')
+const os = require('node:os')
+const path = require('node:path')
+const { test } = require('node:test')
+
+// 必须在 require credentials.js（lan-proxy 的依赖）之前指向临时文件，否则测试会污染真实凭据库。
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-lan-ipv6-'))
+process.env.DEVICE_CREDENTIALS_FILE = path.join(tmp, 'relay-device-credentials.json')
+
+const { createLanProxy } = require('../lib/relay/lan-proxy.js')
+const core = require('../lib/relay/core.js')
+const { isGlobalUnicastV6 } = require('../lib/relay/lan-network.cjs')
+
+const INSTANCE = 'lanipv601'
+const CODE = '246810'
+const SECRET = 'lan-ipv6-secret-0123456789'
+const HOST_TOKEN = core.signLanToken(SECRET, INSTANCE, core.MOBILE_BEARER_TTL_SEC)
+/** 配对被拒时 lan-proxy 回的响应（`pairDenied`）：被拦下来的来源必须与它一字不差。 */
+const PAIR_DENIED = { ok: false, error: '配对码错误或桌面端已拒绝' }
+
+/** 本机是否真的能听 `::1`（IPv6 被关掉的机器上这条用例没有意义，跳过而不是失败）。 */
+async function hasIpv6Loopback() {
+  const probe = net.createServer()
+  try {
+    await new Promise((resolve, reject) => {
+      probe.once('error', reject)
+      probe.listen(0, '::1', resolve)
+    })
+    return true
+  } catch {
+    return false
+  } finally {
+    try { probe.close() } catch { /* 没监听成 */ }
+  }
+}
+
+/** 一次请求。`host` / `family` 决定走哪个协议族，`localAddress` 决定服务端看到的来源地址。 */
+function request(port, { host = '127.0.0.1', family, localAddress, method = 'GET', path: p, headers = {}, body } = {}) {
+  return new Promise((resolve, reject) => {
+    const options = { host, port, method, path: p, headers }
+    if (family) options.family = family
+    if (localAddress) options.localAddress = localAddress
+    const req = http.request(options, (res) => {
+      let data = ''
+      res.on('data', (chunk) => { data += chunk })
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data }))
+    })
+    req.on('error', reject)
+    if (body !== undefined) req.write(body)
+    req.end()
+  })
+}
+
+/** 打一次配对接口。不传 `code` 就是用正确的配对码。 */
+function pair(port, { code = CODE, ...rest } = {}) {
+  return request(port, {
+    ...rest,
+    method: 'POST',
+    path: '/__lan_pair',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code, device: { name: '测试手机', platform: 'ios' } }),
+  })
+}
+
+/** 假宿主：只回「我来过」，用于证明请求真的被代理到了上游。 */
+function startUpstream() {
+  const seen = []
+  const server = http.createServer((req, res) => {
+    req.on('data', () => {})
+    req.on('end', () => {
+      seen.push({ method: req.method, url: req.url })
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({ ok: true, upstream: true, path: req.url }))
+    })
+  })
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve({ server, seen, port: server.address().port }))
+  })
+}
+
+/**
+ * 本机的原生全球单播 IPv6 地址：用它当**来源地址**，才可能在这台机器上真的验一次
+ * 「公网 IPv6 打进来」。分类直接用宿主那一份判据，这里不另写一套。
+ */
+function globalV6Sources() {
+  const out = []
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const item of list || []) {
+      if ((item.family === 'IPv6' || item.family === 6) && isGlobalUnicastV6(item.address)) out.push(item.address)
+    }
+  }
+  return out
+}
+
+/**
+ * 占住一个端口（IPv4 上），用来逼代理走「首选端口被占 → 退到内核分配」那条自愈路径。
+ */
+function holdPort() {
+  const holder = net.createServer()
+  return new Promise((resolve) => {
+    holder.listen(0, '0.0.0.0', () => resolve({ holder, port: holder.address().port }))
+  })
+}
+
+/** 起一个真实的 lan-proxy（端口照旧走 listen(0)），并把日志收在数组里。 */
+async function startProxy(upstreamPort, extra = {}) {
+  const logs = []
+  const proxy = createLanProxy({
+    lanPort: 0,
+    pairingCode: CODE,
+    instanceId: INSTANCE,
+    lanSecret: SECRET,
+    upstreamPort,
+    onLog: (...args) => logs.push(args.join(' ')),
+    ...extra,
+  })
+  await proxy.start()
+  return { proxy, logs, port: proxy.port() }
+}
+
+test('双栈：同一个实例上 IPv4 与 IPv6 都通，且走到同一条 handler', async (t) => {
+  if (!(await hasIpv6Loopback())) {
+    t.skip('本机没有 IPv6 环回')
+    return
+  }
+  const upstream = await startUpstream()
+  const { proxy, port } = await startProxy(upstream.port)
+  try {
+    assert.ok(port > 0, '借的是内核分配的空闲端口')
+
+    // 无需鉴权的路径：两侧都得通（IPv6 那条监听起没起来，看的就是这一发）。
+    const healthV4 = await request(port, { host: '127.0.0.1', path: '/healthz' })
+    const healthV6 = await request(port, { host: '::1', family: 6, path: '/healthz' })
+    assert.equal(healthV4.status, 200, 'IPv4 侧应通')
+    assert.equal(healthV6.status, 200, 'IPv6 侧应通（`::` 那条监听）')
+    assert.equal(healthV4.body, 'ok')
+    assert.equal(healthV6.body, 'ok')
+
+    // 鉴权过的路径：两侧都要被代理到同一个上游、响应同形 —— 「同一 handler」的证据。
+    const authed = (host, family) => request(port, {
+      host,
+      family,
+      path: '/api/mobile/v1/status',
+      headers: { authorization: `Bearer ${HOST_TOKEN}` },
+    })
+    const viaV4 = await authed('127.0.0.1')
+    const viaV6 = await authed('::1', 6)
+    assert.equal(viaV4.status, 200, 'IPv4 侧应被代理')
+    assert.equal(viaV6.status, 200, 'IPv6 侧应被代理')
+    assert.equal(viaV6.body, viaV4.body, '两侧响应必须同形')
+    assert.equal(upstream.seen.length, 2, '两侧的请求都该到上游')
+  } finally {
+    proxy.stop()
+    await new Promise((resolve) => upstream.server.close(resolve))
+  }
+})
+
+// 需求已确认：代理不自行换端口，迁移由发现能力保护后的生命周期决定。
+test('指定端口被占时明确失败，释放旧监听后可以重试同一个端口', async () => {
+  const held = await holdPort()
+  const upstream = await startUpstream()
+  const options = { lanPort: held.port, instanceId: INSTANCE, lanSecret: SECRET, upstreamPort: upstream.port }
+  const first = createLanProxy(options)
+  try {
+    await assert.rejects(first.start(), { code: 'EADDRINUSE' })
+    assert.equal(first.port(), 0, '监听失败不能报告一个活端口')
+    await first.stop()
+    await new Promise(resolve => held.holder.close(resolve))
+    const second = createLanProxy(options)
+    await second.start()
+    assert.equal(second.port(), held.port)
+    await second.stop()
+    const third = createLanProxy(options)
+    await third.start()
+    assert.equal(third.port(), held.port, '停止完成后同端口重启不能换号')
+    await third.stop()
+  } finally {
+    await first.stop()
+    if (held.holder.listening) await new Promise(resolve => held.holder.close(resolve))
+    await new Promise(resolve => upstream.server.close(resolve))
+  }
+})
+
+test('/__lan_pair：原生全球 IPv6 来源被拒，IPv4 来源照旧配对', async (t) => {
+  if (!(await hasIpv6Loopback())) {
+    t.skip('本机没有 IPv6 环回')
+    return
+  }
+  const sources = globalV6Sources()
+  if (sources.length === 0) {
+    t.skip('本机没有全球单播 IPv6 地址')
+    return
+  }
+  const upstream = await startUpstream()
+  const approved = []
+  const { proxy, port } = await startProxy(upstream.port, {
+    onApprove: async (device) => {
+      approved.push(device)
+      return { approved: true, token: HOST_TOKEN }
+    },
+  })
+  try {
+    // 基准：配对码错时是什么响应。被拦下来的来源必须与它一字不差。
+    const wrongCode = await pair(port, { code: '000000' })
+    assert.equal(wrongCode.status, 401)
+    assert.deepEqual(JSON.parse(wrongCode.body), PAIR_DENIED)
+
+    // 原生全球 IPv6 来源：**配对码是对的**也一样拒 —— 拒的是来源，不是码。
+    // 用它当源地址连接 `::1`：服务端 `remoteAddress` 就是这条公网地址。
+    let banned = null
+    let source = null
+    for (const candidate of sources) {
+      try {
+        banned = await pair(port, { host: '::1', family: 6, localAddress: candidate })
+        source = candidate
+        break
+      } catch { /* 临时地址可能刚被轮换掉，换一条再试 */ }
+    }
+    assert.ok(banned, '本机的全球 IPv6 地址一条都拨不通，这条用例没测到东西')
+    assert.equal(banned.status, 401, `来源 ${source} 的配对必须被拒`)
+    assert.deepEqual(JSON.parse(banned.body), PAIR_DENIED, '必须与「配对码错误」同形，不暴露接口存在性')
+    assert.equal(banned.headers['set-cookie'], undefined, '被拒时不得下发 cookie')
+    assert.equal(approved.length, 0, '被拒的来源根本不该走到桌面端授权')
+
+    // IPv4 来源不受影响：同一个实例、同一个配对码，照旧走完整个配对流程。
+    const granted = await pair(port)
+    assert.equal(granted.status, 200, 'IPv4 来源的公网配对是现有受支持用法，不能被一起拦掉')
+    const grant = JSON.parse(granted.body)
+    assert.equal(grant.ok, true)
+    // §3.2：token / cookie / deviceCredential 是同一枚每设备凭据，三段形状。
+    assert.equal(grant.token, grant.deviceCredential)
+    assert.equal(grant.cookie, `dsh_lan=${grant.deviceCredential}`)
+    assert.equal(grant.token.split('.')[0], INSTANCE)
+    // 配对响应要带回宿主自己的直连候选：手输公网地址（域名 / 公网 IP）配对时没有二维码，
+    // 手机只记住那一个公网地址；回家后它若打不通（路由器不支持回环），这批候选是手机
+    // 找到内网地址的唯一来源。
+    assert.ok(Array.isArray(grant.lanUrls) && grant.lanUrls.length > 0, '配对响应要带回直连候选')
+    assert.ok(grant.lanUrls.every((url) => /^http:\/\/[^/]+:\d+$/.test(url)), `候选形状不对：${JSON.stringify(grant.lanUrls)}`)
+    if (grant.ipv6Candidates !== undefined) {
+      assert.ok(Array.isArray(grant.ipv6Candidates), 'IPv6 候选若给出必须是数组')
+    }
+    assert.equal(approved.length, 1, 'IPv4 来源应照旧送达桌面端授权')
+  } finally {
+    proxy.stop()
+    await new Promise((resolve) => upstream.server.close(resolve))
+  }
+})
+
+/**
+ * `ipv6Only` 真的传到了内核，而不是被当成 backlog 丢掉。
+ *
+ * `listen(port, host, backlog)` 的第三位是 backlog（数字），把 `{ ipv6Only: true }` 传在那
+ * 儿会被**静默忽略**。macOS / BSD 的 v6 套接字默认就是 v6only，所以「IPv6 侧应通」在 mac
+ * 上一直绿；Linux 默认双栈，忽略之后 `::` 会和 `0.0.0.0` 撞成 EADDRINUSE，整条 IPv6 监听
+ * 静默不建立 —— 只在 CI 的 Linux runner 上照得出来。
+ *
+ * 判据不依赖平台：直接拿 `::` 单独起一个监听，`ipv6Only: true` 时 IPv4 拨不进去。两条写法
+ * 各跑一次，**必须一个单栈、一个双栈** —— 两者行为相同就说明该选项根本没被采纳。
+ */
+test('ipv6Only 走 options 位置才生效（旧写法会被当 backlog 丢掉）', async (t) => {
+  if (!(await hasIpv6Loopback())) {
+    t.skip('本机没有 IPv6 环回')
+    return
+  }
+
+  /** 起一个 `::` 监听，回「IPv4 能不能拨进来」。 */
+  const ipv4Reachable = (listenArgs) => new Promise((resolve, reject) => {
+    const server = http.createServer((_req, res) => res.end('ok'))
+    server.once('error', reject)
+    server.listen(...listenArgs, () => {
+      const socket = net.connect(server.address().port, '127.0.0.1')
+      socket.once('connect', () => { socket.destroy(); server.close(); resolve(true) })
+      socket.once('error', () => { server.close(); resolve(false) })
+    })
+  })
+
+  const viaOptions = await ipv4Reachable([{ port: 0, host: '::', ipv6Only: true }])
+  const viaPositional = await ipv4Reachable([0, '::', { ipv6Only: true }])
+
+  assert.equal(viaOptions, false, 'options 写法下 ipv6Only 应生效：IPv4 不该拨得进来')
+  assert.equal(viaPositional, true, '位置参数写法下该选项被忽略：IPv4 会拨进来（lan-proxy 必须用 options 写法）')
+
+  // 把实现也钉住：上面只证明了两种写法的差别，实现改回位置参数写法时本机仍然全绿
+  // （macOS 的 v6 套接字默认就是 v6only），只有这条能挡住退化。
+  const source = fs.readFileSync(path.join(__dirname, '..', 'lib', 'relay', 'lan-proxy.js'), 'utf8')
+  assert.match(
+    source,
+    /v6\.listen\(\{ port: actualPort, host: '::', ipv6Only: true \}\)/,
+    'IPv6 监听必须用 options 形式传 ipv6Only；写成 listen(port, host, {…}) 时它会被当成 backlog 忽略',
+  )
+  assert.doesNotMatch(
+    source,
+    /listen\(actualPort, '::'/,
+    '别退回位置参数写法：ipv6Only 会被忽略，Linux 上 :: 与 0.0.0.0 撞成 EADDRINUSE',
+  )
+})
+
+/*
+ * 这里没覆盖的一格：「IPv6 那条绑不上 → 只留 IPv4 直连」的软失败路径。这台机器上造不出
+ * 那个局面：macOS 只要有一个 `::` 的 socket 占着某端口（哪怕显式 `ipv6Only`），同端口的
+ * `0.0.0.0` 就再也绑不上 —— 于是「IPv6 被占、IPv4 空闲」根本不存在，占住 `::` 只会把
+ * IPv4 一起拖走（代理转而去走「端口被占」那条自愈路径）。挡 IPv6 的机器上，那条监听会
+ * 留一行 `IPv6 监听未建立（…）`，IPv4 照旧可用；分支见 lan-proxy.js 的 startV6。
+ */

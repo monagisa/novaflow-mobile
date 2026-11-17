@@ -1,0 +1,252 @@
+'use strict';
+
+/**
+ * 守卫：列表行下发的 `lastTurn` 必须是**设备无关**的一轮事实。
+ *
+ * 起因（真机）：左侧栏的绿点 / 红点在同一台手机上时好时坏。那份「未读」是宿主按设备
+ * 记的提醒，而列表还要喂镜像快照 —— 快照全局一份、给所有设备读，里面按设备算的结论
+ * 永远是同一台假设备的，于是点开看过也不灭，绕过镜像的那次读又立刻变干净。
+ *
+ * 这里钉三件事：
+ *   1. 行上要带 `lastTurn`（turn / endedAt / status），而且**与设备键无关**；
+ *   2. 它不受已读水位影响：`/session/read` 之后事实照旧在，只是不再算「未读提醒」；
+ *   3. 同一轮重复折叠时结束时刻只前进不后退。
+ */
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { buildSessionsResponse } = require('../lib/mobile/sessions.js');
+const { lastTurnOf, settleOutcome, recordLastTurn, recordSessionRead } = require('../lib/mobile/session-last-turn.js');
+const readReceipt = require('../lib/read-receipt.cjs');
+const { handleSessionRead } = require('../lib/mobile/sessions.js');
+const { Readable } = require('node:stream');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+// handleSessionRead 会往 $DSH_HOME 写已读回执：指到临时目录，别碰真实的家目录。
+const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-last-turn-'));
+process.env.DSH_HOME = home;
+test.after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+const SID = 'session-last-turn';
+
+function makeCtx() {
+  const current = { events: [], running: false, updatedAt: 0 };
+  const ctx = {
+    apiProxy: {
+      sessions: {
+        list: async () => ({
+          result: {
+            ok: true,
+            value: {
+              items: [{
+                sessionId: SID, title: '会话', cwd: '/w', updatedAt: current.updatedAt,
+                running: current.running, blank: false,
+              }],
+            },
+          },
+        }),
+        history: async () => ({ result: { ok: true, value: { events: current.events } } }),
+      },
+      workspace: { list: async () => ({ result: { ok: true, value: { items: [], archivedSessionIds: [] } } }) },
+    },
+  };
+  ctx.current = current;
+  return ctx;
+}
+
+const turnStart = (turn) => ({ event: { type: 'turn/start', seq: 1, time: 10, data: { turn } } });
+const assistant = (turn, seq = 2) => ({
+  event: { type: 'assistant/message', seq, time: 11, data: { turn, message: { role: 'assistant', content: [{ type: 'text', text: '…' }] } } },
+});
+const turnEnd = (turn, reason, at = 12) => ({ event: { type: 'turn/end', seq: 3, time: at, data: { turn, reason } } });
+const SUCCEEDED = [turnStart(7), assistant(7), turnEnd(7, { kind: 'completed' }, 12)];
+const FAILED = [turnStart(8), assistant(8), turnEnd(8, { kind: 'error', error: { code: 'AUTH', message: '额度不足' } }, 34)];
+
+async function step(ctx, events, { running, updatedAt }) {
+  ctx.current.events = events;
+  ctx.current.running = running;
+  ctx.current.updatedAt = updatedAt;
+  const response = await buildSessionsResponse(ctx, 'phone-a');
+  assert.equal(response.status, 200);
+  return response.body.items.find((item) => item.sessionId === SID);
+}
+
+function readReq(deviceHeader) {
+  const req = Readable.from([Buffer.from(JSON.stringify({ sessionId: SID }))]);
+  req.headers = deviceHeader ? { 'x-dsh-device': deviceHeader } : {};
+  return req;
+}
+function makeRes() {
+  const res = { status: null, body: null };
+  res.writeHead = (status) => { res.status = status; };
+  res.end = (payload) => { res.body = JSON.parse(payload); };
+  return res;
+}
+
+test('成功收尾：行上带 lastTurn（turn / endedAt / status）', async () => {
+  const ctx = makeCtx();
+  await step(ctx, SUCCEEDED, { running: true, updatedAt: 10 });
+  const row = await step(ctx, SUCCEEDED, { running: false, updatedAt: 11 });
+  assert.deepEqual(row.lastTurn, { turn: 7, endedAt: 12, status: 'completed' });
+  assert.equal(row.completed, true, '这台设备没读过，提醒那一份照旧亮着');
+});
+
+test('失败收尾：事实里带错误码，行上同时有提醒的 lastTurnError', async () => {
+  const ctx = makeCtx();
+  await step(ctx, FAILED, { running: true, updatedAt: 20 });
+  const row = await step(ctx, FAILED, { running: false, updatedAt: 21 });
+  assert.equal(row.lastTurn.status, 'failed');
+  assert.equal(row.lastTurn.code, 'AUTH');
+  assert.equal(row.lastTurn.endedAt, 34);
+  assert.equal(row.lastTurn.message, '额度不足');
+});
+
+test('换一台设备读同一份清单：lastTurn 一字不差（它跟谁在问无关）', async () => {
+  const ctx = makeCtx();
+  await step(ctx, SUCCEEDED, { running: true, updatedAt: 10 });
+  await step(ctx, SUCCEEDED, { running: false, updatedAt: 11 });
+  ctx.current.events = SUCCEEDED;
+  const phoneA = (await buildSessionsResponse(ctx, 'phone-a')).body.items.find((i) => i.sessionId === SID);
+  const phoneB = (await buildSessionsResponse(ctx, 'phone-b')).body.items.find((i) => i.sessionId === SID);
+  assert.deepEqual(phoneA.lastTurn, phoneB.lastTurn);
+});
+
+test('已读之后：事实还在，只是不再算这台设备的未读提醒', async () => {
+  const ctx = makeCtx();
+  await step(ctx, SUCCEEDED, { running: true, updatedAt: 10 });
+  const before = await step(ctx, SUCCEEDED, { running: false, updatedAt: 11 });
+  assert.equal(before.completed, true);
+
+  const res = makeRes();
+  await handleSessionRead(ctx, readReq('phone-a'), res, 'legacy');
+  assert.equal(res.status, 200);
+
+  const after = await step(ctx, SUCCEEDED, { running: false, updatedAt: 11 });
+  assert.equal(after.completed, false, '提醒被清掉了');
+  assert.deepEqual(
+    { turn: after.lastTurn.turn, endedAt: after.lastTurn.endedAt, status: after.lastTurn.status },
+    { turn: before.lastTurn.turn, endedAt: before.lastTurn.endedAt, status: before.lastTurn.status },
+    '事实不随已读消失 —— App 靠它自己算点',
+  );
+  assert.ok(after.lastTurn.readAt > 0, '这次读过还会留一条设备无关水位（另一台设备/桌面读也走这条）');
+});
+
+test('同一轮重复折叠：结束时刻只前进不后退', () => {
+  const ctx = {};
+  recordLastTurn(ctx, SID, { turn: 3, endedAt: 100, status: 'completed' });
+  recordLastTurn(ctx, SID, { turn: 3, endedAt: 100, status: 'completed' });
+  assert.equal(lastTurnOf(ctx, SID).endedAt, 100);
+  recordLastTurn(ctx, SID, { turn: 3, endedAt: 90, status: 'completed' });
+  assert.equal(lastTurnOf(ctx, SID).endedAt, 100, '更早的结束时刻不许把水位往回拨');
+  recordLastTurn(ctx, SID, { turn: 4, endedAt: 200, status: 'canceled' });
+  assert.equal(lastTurnOf(ctx, SID).turn, 4);
+});
+
+// 真机报的那一步：桌面点开对话，绿点灭了，手机上等一两分钟都不灭。原因是「读过」只落在
+// 按设备的提醒里，而镜像快照给所有设备读、进不了那本账 —— 现在补一条设备无关的已读水位，
+// 由 App 与它自己那份一起取较大值。
+test('桌面读过：设备无关水位进清单，行上带 readAt', async () => {
+  const ctx = makeCtx();
+  await step(ctx, SUCCEEDED, { running: true, updatedAt: 10 });
+  const before = await step(ctx, SUCCEEDED, { running: false, updatedAt: 11 });
+  assert.equal(before.lastTurn.readAt, undefined, '还没人读过');
+
+  assert.equal(recordSessionRead(ctx, SID, 900), true);
+  const after = await step(ctx, SUCCEEDED, { running: false, updatedAt: 11 });
+  assert.equal(after.lastTurn.readAt, 900);
+  assert.deepEqual(
+    { turn: after.lastTurn.turn, endedAt: after.lastTurn.endedAt, status: after.lastTurn.status },
+    { turn: before.lastTurn.turn, endedAt: before.lastTurn.endedAt, status: before.lastTurn.status },
+    '其余事实一个字都不该变',
+  );
+});
+
+test('已读水位只前进，且重复上报返回 false（不许每次都抬列表缓存）', () => {
+  const ctx = {};
+  recordLastTurn(ctx, SID, { turn: 2, endedAt: 100, status: 'completed' });
+  assert.equal(recordSessionRead(ctx, SID, 500), true);
+  assert.equal(recordSessionRead(ctx, SID, 500), false, '同一时刻重复上报不算前进');
+  assert.equal(recordSessionRead(ctx, SID, 400), false, '更早的时刻不许回拨');
+  assert.equal(lastTurnOf(ctx, SID).readAt, 500);
+});
+
+test('水位不吞新事实：读过之后又跑完一轮，readAt 留着、事实照样更新', () => {
+  const ctx = {};
+  recordLastTurn(ctx, SID, { turn: 2, endedAt: 100, status: 'completed' });
+  recordSessionRead(ctx, SID, 500);
+  recordLastTurn(ctx, SID, { turn: 3, endedAt: 900, status: 'completed' });
+  const fact = lastTurnOf(ctx, SID);
+  assert.equal(fact.turn, 3);
+  assert.equal(fact.endedAt, 900);
+  assert.equal(fact.readAt, 500, '换新事实时已读水位必须原样带上，否则刚读过的一轮会重新亮');
+});
+
+test('只有一个已读水位、没有轮次事实时不下发（重启后还没折过那轮）', () => {
+  const ctx = {};
+  recordSessionRead(ctx, SID, 500);
+  assert.equal(lastTurnOf(ctx, SID), undefined);
+});
+
+// 真机报的那一步（2026-10-26）：桌面上那条已经是「已完成」，App 侧栏还挂着绿点，重启
+// App 之后又回来。根因是这张事地表只活在进程里：宿主一重启，「桌面读过」就没了，列表
+// 折出来的事实只剩结束时刻，App 按「没人读过」重算 → 又亮。盘上那本已读台账是唯一还记着
+// 这件事的地方，所以得从这里补回来。
+test('重启后从圆盘台账补回已读水位：上一轮读过的不再算未读', () => {
+  const RESTORED = 'session-restored-from-receipts';
+  const readAt = Date.now() - 3_600_000;
+  readReceipt.recordRead(RESTORED, readAt);
+  const ctx = {};
+  recordLastTurn(ctx, RESTORED, { turn: 5, endedAt: readAt - 1000, status: 'completed' });
+  assert.equal(lastTurnOf(ctx, RESTORED).readAt, readAt, '上一轮在读过之前结束，水位要从台账补回来');
+  recordLastTurn(ctx, RESTORED, { turn: 5, endedAt: readAt - 1000, status: 'completed' });
+  assert.equal(lastTurnOf(ctx, RESTORED).readAt, readAt, '重新折叠也要带着这份水位，不许退回没有');
+});
+
+// 读完之后才跑完的这一轮仍然该亮：补水位不能把新的一轮一起吞掉。
+test('台账里的水位不会吞掉之后结束的那一轮', () => {
+  const LATER = 'session-restored-then-new-turn';
+  const readAt = Date.now() - 3_600_000;
+  readReceipt.recordRead(LATER, readAt);
+  const ctx = {};
+  recordLastTurn(ctx, LATER, { turn: 6, endedAt: readAt + 5000, status: 'completed' });
+  assert.equal(lastTurnOf(ctx, LATER).readAt, readAt);
+  assert.ok(lastTurnOf(ctx, LATER).endedAt > readAt, '结束时刻晚于水位 ⇒ App 那边仍然算未读');
+});
+
+// 另一头：本进程内的读必须同时落进圆盘台账（桌面端绿点靠它清）。这条以前只在手机那条
+// 路上单独写过，现在收在 recordSessionRead 里，两端一起有。
+test('记一笔已读会同时写进圆盘台账（桌面端绿点靠它）', () => {
+  const PERSISTED = 'session-read-persisted';
+  assert.equal(readReceipt.readAtOf(PERSISTED), 0, '还没读过时台账里没有这一条');
+  recordSessionRead({}, PERSISTED, Date.now());
+  assert.ok(readReceipt.readAtOf(PERSISTED) > 0, '读过之后台账里必须留下水位');
+});
+
+test('settleOutcome：assistant 必须是本轮已落定的那条', () => {
+  const end = { seq: 5, time: 50, data: { turn: 1, reason: { kind: 'completed' } } };
+  assert.equal(settleOutcome({ turn: 1, end, assistant: { seq: 4, data: {} } }).status, 'completed');
+  // assistant 落在 turn/end 之后：那是下一轮的开头，不能拿它冒充已完成。
+  assert.equal(settleOutcome({ turn: 1, end, assistant: { seq: 9, data: {} } }).status, 'incomplete');
+  assert.equal(settleOutcome({ turn: 1, end, assistant: { seq: 4, data: { interrupted: true } } }).status, 'incomplete');
+});
+
+// ── 上一轮事实要落盘（2026-11-10）──────────────────────────────
+// 手机侧的离线补投判据要的是「这一轮什么时候结束的、成没成」。这张表按 ctx 隔离、进程一换
+// 就空，不落盘的话电脑重启之后 `/monitor` 不再带 `lastTurn`，补投整段失效 —— 而「电脑和
+// 手机一起重启」正是最常见的场景。这里钉住「折叠时落盘」与「新进程从盘上补回」两头。
+test('折出一轮事实时同时落盘，换一个新 ctx（等于宿主重启）仍读得到', () => {
+  const sessionId = 'session-restart';
+  const ctx = {};
+  recordLastTurn(ctx, sessionId, { turn: 5, endedAt: 9_000, status: 'completed' });
+  assert.equal(lastTurnOf(ctx, sessionId).turn, 5, '本进程内直接读得到');
+
+  // 新 ctx = 内存表是空的（宿主重启）：事实必须从盘上补回来。
+  const freshCtx = {};
+  const restored = lastTurnOf(freshCtx, sessionId);
+  assert.equal(restored?.turn, 5, '重启后要能从圆盘台账补回上一轮事实');
+  assert.equal(restored?.status, 'completed');
+  assert.equal(restored?.endedAt, 9_000);
+  assert.equal(readReceipt.turnOf(sessionId).turn, 5, '台账里也要有这一笔');
+});
