@@ -82,7 +82,7 @@
     "dsh-mobile-shell-linux-x64": "0.1.2",
     "dsh-mobile-shell-win32-x64": "0.1.2",
     "dsh-mobile-tailcat-darwin-arm64": "1.1.2",
-    "dsh-mobile-tailcat-darwin-x64": "1.1.2",
+    "dsh-mobile-tailcat-darwin-x64": "1.1.5",
     "dsh-mobile-tailcat-linux-arm64": "1.1.2",
     "dsh-mobile-tailcat-linux-x64": "1.1.2",
     "dsh-mobile-tailcat-win32-x64": "1.1.2"
